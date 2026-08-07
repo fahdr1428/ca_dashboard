@@ -141,10 +141,17 @@ export function BandDistributionChart({
   onSelect?: (band: string) => void;
 }) {
   return (
-    <ResponsiveContainer width="100%" height={200}>
-      <BarChart data={data} margin={{ top: 8, right: 8, left: 4, bottom: 4 }}>
+    <ResponsiveContainer width="100%" height={216}>
+      <BarChart data={data} margin={{ top: 8, right: 8, left: 4, bottom: 0 }}>
         <CartesianGrid strokeDasharray="2 4" vertical={false} />
-        <XAxis dataKey="short" {...AXIS} interval={0} tick={{ fontSize: 10 }} height={20} />
+        <XAxis
+          dataKey="short"
+          {...AXIS}
+          interval={0}
+          tick={{ fontSize: 10 }}
+          height={28}
+          tickMargin={6}
+        />
         <YAxis {...AXIS} allowDecimals={false} width={28} />
         <Tooltip
           cursor={{ fill: "var(--color-surface-2)" }}
