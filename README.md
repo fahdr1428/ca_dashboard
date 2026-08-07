@@ -34,28 +34,60 @@ doing its job.
 
 ## Quick start
 
+You need Node 20+ and a PostgreSQL 14+ database. If you have Docker, the
+database is one command; otherwise point `DATABASE_URL` at your own instance.
+
 ```bash
-# 1. Dependencies
+docker compose up -d     # PostgreSQL on :5432 (skip if you have your own)
 npm install
-
-# 2. Configuration
-cp .env.example .env
-# Edit .env: set DATABASE_URL, DASHBOARD_PASSWORD, AUTH_SECRET, CRON_SECRET.
-#   openssl rand -base64 48   # AUTH_SECRET
-#   openssl rand -hex 32      # CRON_SECRET
-
-# 3. Database
-npx prisma generate
-npx prisma db push
-
-# 4. Demo data (fictional — see below)
-npm run db:seed
-
-# 5. Run
+npm run setup            # generates .env with real secrets, applies the
+                         # schema, loads the demo data — and prints your
+                         # sign-in passphrase
 npm run dev
 ```
 
-Open http://localhost:3000 and sign in with `DASHBOARD_PASSWORD`.
+Open http://localhost:3000 and sign in with the passphrase `npm run setup`
+printed. Change `DASHBOARD_PASSWORD` in `.env` if you'd prefer something
+memorable.
+
+`npm run setup` is idempotent and never overwrites an existing `.env`, so it is
+safe to re-run — for example after starting the database.
+
+<details>
+<summary>Manual setup, if you'd rather do it step by step</summary>
+
+```bash
+cp .env.example .env
+# Set DATABASE_URL, then generate the secrets:
+#   openssl rand -base64 36   # AUTH_SECRET
+#   openssl rand -hex 32      # CRON_SECRET
+#   Pick your own DASHBOARD_PASSWORD
+
+npx prisma generate
+npx prisma db push
+npm run db:seed
+npm run dev
+```
+
+</details>
+
+### Switching from demo data to live records
+
+1. Get a free API key from
+   [developer.company-information.service.gov.uk](https://developer.company-information.service.gov.uk/)
+   — register, create an application, and take the REST API key.
+2. Put it in `.env` as `COMPANIES_HOUSE_API_KEY`.
+3. Restart the dev server, open **Automation**, and press **Run ingest**.
+
+The connector searches each of the 13 counties for active companies in
+owner-managed SIC codes, reads the PSC register to establish who controls them,
+pulls officer records to confirm identity, and watches filing history for
+change. The demo banner disappears once real records land.
+
+The news connector needs no key and runs by default. If your network blocks
+outbound HTTP to the publisher feeds you'll see per-feed warnings on the
+Automation page and the run will be marked `PARTIAL` — that is the connector
+degrading correctly, not a failure of the app.
 
 ### Demo data
 
@@ -209,9 +241,11 @@ mean polling sources that have not changed.
 ## Commands
 
 ```bash
+npm run setup            # first-run: .env + schema + demo data
 npm run dev              # development server
 npm run build            # production build (runs prisma generate first)
 npm run typecheck        # tsc --noEmit
+npm test                 # unit tests (no database or network needed)
 npm run db:push          # apply schema to the database
 npm run db:seed          # load the fictional demo dataset
 npm run db:studio        # Prisma Studio

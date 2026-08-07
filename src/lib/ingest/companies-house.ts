@@ -354,6 +354,13 @@ export function createCompaniesHouseConnector(): Connector {
         "Dorset", "Hampshire", "West Sussex", "Surrey", "Berkshire", "London", "Oxfordshire",
       ];
 
+      // If the register is down or the key is rejected, the failure will repeat
+      // for every county. Retrying all thirteen wastes minutes of backoff and
+      // hammers an API that has already told us it can't help, so give up after
+      // two consecutive failures and report once.
+      let consecutiveFailures = 0;
+      const FAILURE_LIMIT = 2;
+
       for (const location of locations) {
         let page = 0;
         try {
@@ -477,12 +484,20 @@ export function createCompaniesHouseConnector(): Connector {
               result.companies.push(company);
             }
           }
+          consecutiveFailures = 0;
         } catch (err) {
+          consecutiveFailures++;
           result.warnings.push(
             `Companies House search for ${location} stopped at page ${page}: ${
               err instanceof Error ? err.message : String(err)
             }`,
           );
+          if (consecutiveFailures >= FAILURE_LIMIT) {
+            result.warnings.push(
+              `Companies House failed ${consecutiveFailures} counties in a row — abandoning the rest of this run. Check the API key and https://status.company-information.service.gov.uk.`,
+            );
+            break;
+          }
         }
       }
 

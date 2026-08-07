@@ -3,19 +3,21 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
+    "setup": "node scripts/setup.mjs",
     "dev": "next dev",
     "build": "prisma generate && next build",
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/lib/**/*.test.ts",
     "db:push": "prisma db push",
     "db:seed": "tsx prisma/seed.ts",
     "db:studio": "prisma studio",
     "ingest": "tsx scripts/ingest.ts",
+    "recompute": "tsx scripts/recompute.ts",
     "report:weekly": "tsx scripts/weekly-report.ts",
     "geo:build": "tsx scripts/build-geo.ts",
-    "recompute": "tsx scripts/recompute.ts",
-    "test": "tsx --test src/lib/**/*.test.ts"
+    "postinstall": "prisma generate || exit 0"
   },
   "dependencies": {
     "@prisma/adapter-pg": "^7.9.1",

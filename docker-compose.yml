@@ -1,0 +1,26 @@
+# Local PostgreSQL for development.
+#
+#   docker compose up -d
+#
+# Matches the DATABASE_URL in .env.example, so nothing else needs configuring.
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ca_dashboard_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ca_dash
+      POSTGRES_PASSWORD: ca_dash_dev
+      POSTGRES_DB: ca_dashboard
+    ports:
+      - "5432:5432"
+    volumes:
+      - ca_dashboard_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ca_dash -d ca_dashboard"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  ca_dashboard_pgdata:
