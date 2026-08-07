@@ -1,0 +1,27 @@
+# Weekly refresh for deployments that aren't on Vercel.
+#
+# Calls the same endpoint the Vercel cron would. Set two repository secrets:
+#   DASHBOARD_URL  e.g. https://leads.yourfirm.co.uk
+#   CRON_SECRET    the value from the deployment's environment
+name: Weekly refresh
+
+on:
+  schedule:
+    # 07:00 UTC every Monday.
+    - cron: "0 7 * * 1"
+  workflow_dispatch:
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger weekly ingest and report
+        run: |
+          response=$(curl -sS --fail-with-body \
+            -X POST "${{ secrets.DASHBOARD_URL }}/api/cron/weekly" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            --max-time 850)
+          echo "$response"
+          echo "$response" | grep -q '"ok":true' || {
+            echo "::warning::Weekly run reported errors — check the Automation page."
+          }

@@ -1,0 +1,615 @@
+// Wealth Advisor Lead Intelligence Dashboard — data model
+//
+// Design principles baked into this schema:
+//  1. PROVENANCE FIRST. Nothing that is presented to an advisor as a fact or an
+//     estimate may exist without at least one Citation pointing at a public,
+//     re-checkable Source. See the `Citation` model.
+//  2. ESTIMATES ARE NEVER FACTS. Every monetary figure the system derives is
+//     stored as a low/mid/high range plus a machine-readable breakdown of how it
+//     was computed (`Prospect.estimateBreakdown`), so the UI can always show its
+//     working.
+//  3. HISTORY IS KEPT. WealthSnapshot + ProspectEvent give us "wealth has
+//     materially increased recently" and the weekly change report for free.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+/// The 13 in-scope regions. The dashboard hard-refuses to persist a prospect
+/// outside this list (see src/lib/regions.ts).
+enum Region {
+  CORNWALL
+  DEVON
+  SOMERSET
+  BRISTOL
+  GLOUCESTERSHIRE
+  WILTSHIRE
+  DORSET
+  HAMPSHIRE
+  WEST_SUSSEX
+  SURREY
+  BERKSHIRE
+  GREATER_LONDON
+  OXFORDSHIRE
+}
+
+/// Estimated investable-asset bands. The advisor's qualifying threshold is
+/// £7.5m; BAND_15_30 and above is the "priority founder" tier.
+enum WealthBand {
+  BELOW_7_5M
+  BAND_7_5_15M
+  BAND_15_30M
+  BAND_30_50M
+  BAND_50_100M
+  BAND_100M_PLUS
+}
+
+enum ConfidenceBand {
+  LOW
+  MEDIUM
+  HIGH
+  VERIFIED
+}
+
+enum LeadStatus {
+  NEW
+  RESEARCHING
+  QUALIFIED
+  CONTACTED
+  MEETING_BOOKED
+  IN_DISCUSSION
+  CLIENT
+  NURTURE
+  DISQUALIFIED
+}
+
+enum RelationshipStage {
+  UNAWARE
+  AWARE
+  INTRODUCED
+  ENGAGED
+  PROPOSAL
+  ONBOARDING
+  CLIENT
+  LAPSED
+}
+
+enum SourceType {
+  COMPANIES_HOUSE
+  COMPANY_ACCOUNTS
+  RNS_REGULATORY
+  PRESS_RELEASE
+  NEWS
+  FUNDING_DATABASE
+  OPEN_DATASET
+  PUBLIC_WEALTH_LIST
+  LAND_REGISTRY
+  CHARITY_COMMISSION
+  LINKEDIN
+  COMPANY_WEBSITE
+  MANUAL
+}
+
+enum SignalType {
+  LARGE_DIVIDEND
+  REVENUE_GROWTH
+  HIGH_PROFITABILITY
+  PE_INVESTMENT
+  VENTURE_FUNDING
+  MA_ACTIVITY
+  IPO_PREPARATION
+  DIRECTOR_APPOINTMENT
+  SHARE_SALE
+  PROPERTY_ACQUISITION
+  PUBLIC_INVESTMENT
+  FAMILY_OFFICE
+  LIQUIDITY_EVENT
+  BUSINESS_EXIT
+  INHERITANCE
+  HIGH_REMUNERATION
+  WEALTH_LIST_ENTRY
+  FILING_UPDATE
+  NEWS_MENTION
+  PSC_CHANGE
+}
+
+enum SignalStatus {
+  NEW
+  REVIEWED
+  ACTIONED
+  DISMISSED
+}
+
+enum CorporateEventType {
+  ACQUISITION_OF
+  ACQUIRED_BY
+  MERGER
+  IPO
+  MBO
+  SECONDARY_SALE
+  TRADE_SALE
+  ADMINISTRATION
+}
+
+enum EvidenceStrength {
+  /// Directly stated in a statutory filing (PSC register, confirmation statement)
+  FILED
+  /// Stated in a regulated disclosure or company-issued release
+  DISCLOSED
+  /// Stated by credible journalism
+  REPORTED
+  /// Derived by this system's models from filed inputs
+  MODELLED
+  /// Human research note
+  ASSERTED
+}
+
+enum IngestTrigger {
+  CRON_WEEKLY
+  MANUAL
+  API
+  BACKFILL
+}
+
+enum RunStatus {
+  RUNNING
+  SUCCESS
+  PARTIAL
+  FAILED
+}
+
+// ---------------------------------------------------------------------------
+// Provenance
+// ---------------------------------------------------------------------------
+
+/// A single public, re-checkable document. Sources are deduplicated on URL so
+/// that one filing cited by twelve prospects is stored once.
+model Source {
+  id          String     @id @default(cuid())
+  url         String     @unique
+  title       String
+  publisher   String?
+  sourceType  SourceType
+  publishedAt DateTime?
+  retrievedAt DateTime   @default(now())
+
+  /// 1 (weak blog) .. 5 (statutory filing). Feeds the confidence model.
+  reliability Int     @default(3)
+  /// Short verbatim quote supporting the claim, for advisor verification.
+  excerpt     String?
+  /// Licence / terms note, e.g. "Companies House — Open Government Licence v3.0"
+  licence     String?
+  /// True only for sources anyone can open without a login or paywall.
+  isPublic    Boolean @default(true)
+
+  citations Citation[]
+  signals   Signal[]
+
+  @@index([sourceType, publishedAt])
+}
+
+/// Links a Source to any entity (and optionally to a single field on it), so the
+/// UI can render "why do we believe this number?" next to the number itself.
+model Citation {
+  id         String   @id @default(cuid())
+  sourceId   String
+  source     Source   @relation(fields: [sourceId], references: [id], onDelete: Cascade)
+  /// "prospect" | "company" | "shareholding" | "financial" | "signal" | ...
+  entityType String
+  entityId   String
+  /// Optional field name this source substantiates, e.g. "ownershipPct".
+  field      String?
+  note       String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([sourceId, entityType, entityId, field])
+  @@index([entityType, entityId])
+}
+
+// ---------------------------------------------------------------------------
+// Companies
+// ---------------------------------------------------------------------------
+
+model Company {
+  id     String @id @default(cuid())
+  name   String
+  slug   String @unique
+  /// Companies House registered number — the join key we verify ownership on.
+  companyNumber String? @unique
+  status        String? // active / dissolved / liquidation
+  incorporatedOn DateTime?
+
+  industry String?
+  /// Companies House SIC codes.
+  sicCodes String[] @default([])
+
+  region          Region?
+  officeLocation  String?
+  registeredAddress String?
+  latitude        Float?
+  longitude       Float?
+  website         String?
+
+  employees Int?
+
+  /// Latest modelled enterprise/equity valuation. ALWAYS an estimate.
+  estValuationLowGBP  BigInt?
+  estValuationMidGBP  BigInt?
+  estValuationHighGBP BigInt?
+  /// e.g. "EBITDA multiple 8.5x (sector comp)" — rendered verbatim in the UI.
+  valuationMethod     String?
+  valuationMultiple   Float?
+  valuationAsOf       DateTime?
+
+  exitPotential Int? // 0-100, modelled readiness for a liquidity event
+  exitRationale String?
+
+  chLastCheckedAt DateTime?
+  /// Hash of the last Companies House filing history page we saw, so the
+  /// weekly run can detect "something changed" cheaply.
+  chFilingHash    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  financials    CompanyFinancial[]
+  shareholdings Shareholding[]
+  dividends     DividendPayment[]
+  fundingRounds FundingRound[]
+  corporateEvents CorporateEvent[]
+  signals       Signal[]
+  prospects     Prospect[]         @relation("PrimaryCompany")
+
+  @@index([region])
+  @@index([industry])
+}
+
+/// One filed (or reported) accounting period.
+model CompanyFinancial {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  periodEnd  DateTime
+  periodLabel String? // "FY24"
+
+  revenueGBP   BigInt?
+  grossProfitGBP BigInt?
+  ebitdaGBP    BigInt?
+  pretaxProfitGBP BigInt?
+  netAssetsGBP BigInt?
+  cashGBP      BigInt?
+  employees    Int?
+  dividendsDeclaredGBP BigInt?
+
+  /// Small companies filing abridged accounts do not disclose turnover; we mark
+  /// those rows so the model can widen its error bars instead of guessing.
+  isAbridged Boolean @default(false)
+  evidence   EvidenceStrength @default(FILED)
+
+  createdAt DateTime @default(now())
+
+  @@unique([companyId, periodEnd])
+  @@index([companyId, periodEnd])
+}
+
+/// An individual's stake in a company.
+model Shareholding {
+  id         String   @id @default(cuid())
+  prospectId String
+  prospect   Prospect @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  companyId  String
+  company    Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  /// PSC filings give banded ownership (25-50%, 50-75%, 75-100%). We store the
+  /// band and use its midpoint, never pretending to a precision we don't have.
+  ownershipPctLow  Float
+  ownershipPctHigh Float
+  shareClass       String?
+  /// e.g. "PSC register: ownership-of-shares-50-to-75-percent"
+  basis            String?
+  evidence         EvidenceStrength @default(FILED)
+  asOf             DateTime?
+  isCurrent        Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([prospectId, companyId, shareClass])
+  @@index([companyId])
+}
+
+/// Disclosed holdings in listed companies (TR-1 / director dealing RNS).
+model PublicHolding {
+  id         String   @id @default(cuid())
+  prospectId String
+  prospect   Prospect @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+
+  ticker      String?
+  companyName String
+  shares      BigInt?
+  percentHeld Float?
+  valueGBP    BigInt?
+  asOf        DateTime?
+  evidence    EvidenceStrength @default(DISCLOSED)
+
+  createdAt DateTime @default(now())
+
+  @@index([prospectId])
+}
+
+model DividendPayment {
+  id         String   @id @default(cuid())
+  companyId  String
+  company    Company  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  prospectId String?
+  prospect   Prospect? @relation(fields: [prospectId], references: [id], onDelete: SetNull)
+
+  periodEnd DateTime
+  /// Total declared by the company.
+  totalGBP  BigInt
+  /// Share attributed to this prospect via their ownership %. Estimate.
+  attributedGBP BigInt?
+  evidence  EvidenceStrength @default(FILED)
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, periodEnd])
+  @@index([prospectId])
+}
+
+model FundingRound {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  announcedOn DateTime
+  stage       String // Seed / Series A / Growth / PE minority ...
+  amountGBP   BigInt?
+  preMoneyGBP  BigInt?
+  postMoneyGBP BigInt?
+  investors   String[] @default([])
+  evidence    EvidenceStrength @default(REPORTED)
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, announcedOn])
+}
+
+model CorporateEvent {
+  id        String  @id @default(cuid())
+  companyId String
+  company   Company @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  type            CorporateEventType
+  announcedOn     DateTime
+  completedOn     DateTime?
+  counterparty    String?
+  considerationGBP BigInt?
+  /// Was the consideration disclosed, or is it a press estimate?
+  evidence        EvidenceStrength @default(REPORTED)
+  summary         String?
+
+  createdAt DateTime @default(now())
+
+  @@index([companyId, announcedOn])
+}
+
+// ---------------------------------------------------------------------------
+// Prospects
+// ---------------------------------------------------------------------------
+
+model Prospect {
+  id       String @id @default(cuid())
+  fullName String
+  slug     String @unique
+
+  occupation     String?
+  jobTitle       String?
+  companyId      String?
+  company        Company? @relation("PrimaryCompany", fields: [companyId], references: [id], onDelete: SetNull)
+  officeLocation String?
+  region         Region
+  latitude       Float?
+  longitude      Float?
+
+  /// Companies House officer id, when we have matched the person to the
+  /// register. This is what makes "verify ownership on Companies House" real.
+  chOfficerId String?
+  /// Officer identity is fuzzy-matched on name + DOB month/year + address; this
+  /// records how sure we are of the *person*, separately from the money.
+  identityConfidence Int @default(50)
+  linkedinUrl String?
+
+  // ---- Modelled wealth. Every one of these is an ESTIMATE. ----
+  estGrossWealthLowGBP  BigInt @default(0)
+  estGrossWealthMidGBP  BigInt @default(0)
+  estGrossWealthHighGBP BigInt @default(0)
+  /// Subset of gross wealth plausibly available to a discretionary manager.
+  estInvestableLowGBP   BigInt @default(0)
+  estInvestableMidGBP   BigInt @default(0)
+  estInvestableHighGBP  BigInt @default(0)
+  wealthBand            WealthBand @default(BELOW_7_5M)
+  /// Full computation trace: see WealthEstimate in src/lib/scoring/estimate.ts
+  estimateBreakdown     Json?
+
+  confidence        Int            @default(0) // 0-100
+  confidenceBand    ConfidenceBand @default(LOW)
+  confidenceBreakdown Json?
+
+  /// Human-readable "why they were identified", generated from the signals and
+  /// estimate components that qualified them.
+  rationale String?
+
+  status            LeadStatus        @default(NEW)
+  relationshipStage RelationshipStage @default(UNAWARE)
+  owner             String? // advisor initials
+  tags              String[] @default([])
+
+  dateAdded   DateTime  @default(now())
+  lastUpdated DateTime  @updatedAt
+  lastReviewedAt DateTime?
+  /// Set when the prospect asks not to be tracked (UK GDPR Art.21 objection).
+  suppressedAt   DateTime?
+  suppressionReason String?
+
+  shareholdings  Shareholding[]
+  publicHoldings PublicHolding[]
+  dividends      DividendPayment[]
+  signals        Signal[]
+  notes          Note[]
+  events         ProspectEvent[]
+  snapshots      WealthSnapshot[]
+
+  @@index([region, wealthBand])
+  @@index([status])
+  @@index([estInvestableMidGBP])
+  @@index([dateAdded])
+}
+
+model Note {
+  id         String   @id @default(cuid())
+  prospectId String
+  prospect   Prospect @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+
+  body     String
+  author   String?
+  pinned   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@index([prospectId, createdAt])
+}
+
+/// Append-only timeline: status changes, estimate revisions, new evidence.
+model ProspectEvent {
+  id         String   @id @default(cuid())
+  prospectId String
+  prospect   Prospect @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+
+  type    String // "created" | "status_changed" | "estimate_revised" | "signal_linked"
+  message String
+  before  Json?
+  after   Json?
+  actor   String? // "system:companies-house" | "advisor:JD"
+
+  createdAt DateTime @default(now())
+
+  @@index([prospectId, createdAt])
+}
+
+/// Weekly point-in-time snapshot, powering trend charts and "wealth increased".
+model WealthSnapshot {
+  id         String   @id @default(cuid())
+  prospectId String
+  prospect   Prospect @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+
+  takenAt           DateTime @default(now())
+  estGrossMidGBP    BigInt
+  estInvestableMidGBP BigInt
+  confidence        Int
+  wealthBand        WealthBand
+
+  @@index([prospectId, takenAt])
+  @@index([takenAt])
+}
+
+// ---------------------------------------------------------------------------
+// Signals
+// ---------------------------------------------------------------------------
+
+model Signal {
+  id   String     @id @default(cuid())
+  type SignalType
+
+  prospectId String?
+  prospect   Prospect? @relation(fields: [prospectId], references: [id], onDelete: Cascade)
+  companyId  String?
+  company    Company?  @relation(fields: [companyId], references: [id], onDelete: Cascade)
+
+  title   String
+  summary String?
+  /// When the underlying event happened (not when we found it).
+  occurredOn DateTime
+  detectedAt DateTime @default(now())
+
+  /// Monetary size of the event where known, e.g. dividend total, round size.
+  magnitudeGBP BigInt?
+  /// 0-100 contribution this signal makes to qualification.
+  weight       Int     @default(50)
+  confidence   Int     @default(50)
+  status       SignalStatus @default(NEW)
+
+  sourceId String?
+  source   Source? @relation(fields: [sourceId], references: [id], onDelete: SetNull)
+
+  /// Structured detail, e.g. { revenueGrowthPct: 41, fromGBP: ..., toGBP: ... }
+  payload Json?
+
+  /// Stable key so re-running ingestion doesn't duplicate signals.
+  dedupeKey String @unique
+
+  createdAt DateTime @default(now())
+
+  @@index([type, occurredOn])
+  @@index([prospectId, occurredOn])
+  @@index([companyId, occurredOn])
+  @@index([detectedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Automation
+// ---------------------------------------------------------------------------
+
+model IngestRun {
+  id        String        @id @default(cuid())
+  trigger   IngestTrigger
+  status    RunStatus     @default(RUNNING)
+  startedAt DateTime      @default(now())
+  finishedAt DateTime?
+
+  connectorsRun String[] @default([])
+  /// { sourcesSeen, companiesUpserted, prospectsCreated, prospectsUpdated, signalsCreated }
+  stats  Json?
+  errors Json?
+
+  @@index([startedAt])
+}
+
+model WeeklyReport {
+  id        String   @id @default(cuid())
+  weekStart DateTime @unique
+  weekEnd   DateTime
+  generatedAt DateTime @default(now())
+
+  newProspectCount     Int    @default(0)
+  updatedProspectCount Int    @default(0)
+  newSignalCount       Int    @default(0)
+  totalAddressableGBP  BigInt @default(0)
+  deltaAddressableGBP  BigInt @default(0)
+
+  /// Rendered markdown of the full report.
+  summaryMd String
+  /// Structured payload the report page renders from.
+  payload   Json
+
+  deliveredAt DateTime?
+
+  @@index([weekStart])
+}
+
+/// Keyed cache for the scheduler so a re-run in the same week is idempotent.
+model SystemState {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}

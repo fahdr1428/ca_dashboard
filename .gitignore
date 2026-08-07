@@ -1,0 +1,11 @@
+node_modules/
+.next/
+out/
+build/
+.env
+.env*.local
+*.tsbuildinfo
+next-env.d.ts
+src/generated/
+data/eng_lad_topo.json
+.DS_Store

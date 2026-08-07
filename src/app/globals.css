@@ -1,0 +1,153 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+  Executive palette. Light mode is a warm paper neutral so long reading
+  sessions don't glare; dark mode is a cool slate, not pure black, so the
+  charts keep their contrast. One accent (teal) carries money, one (amber)
+  carries signals, and red is reserved for genuine warnings — never decoration.
+*/
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  --color-canvas: #f7f6f3;
+  --color-surface: #ffffff;
+  --color-surface-2: #f2f1ed;
+  --color-line: #e3e1db;
+  --color-line-strong: #cfccc3;
+  --color-ink: #1a1c1e;
+  --color-ink-2: #4a4f55;
+  --color-ink-3: #7c8288;
+
+  --color-accent: #0f766e;
+  --color-accent-soft: #d7ebe8;
+  --color-accent-ink: #0b5750;
+
+  --color-signal: #b45309;
+  --color-signal-soft: #fbeedd;
+
+  --color-danger: #b42318;
+  --color-danger-soft: #fbe7e5;
+
+  --color-positive: #15803d;
+  --color-negative: #b42318;
+
+  /* Wealth-band ramp, cool -> warm as the band rises. */
+  --color-band-slate: #8a9199;
+  --color-band-sky: #3b82c4;
+  --color-band-teal: #0f9488;
+  --color-band-amber: #c2860b;
+  --color-band-violet: #7c5cd6;
+  --color-band-rose: #c2405e;
+}
+
+.dark {
+  --color-canvas: #0e1116;
+  --color-surface: #161a21;
+  --color-surface-2: #1d222b;
+  --color-line: #262c36;
+  --color-line-strong: #39414e;
+  --color-ink: #e8eaed;
+  --color-ink-2: #a5adb8;
+  --color-ink-3: #6f7883;
+
+  --color-accent: #2dd4bf;
+  --color-accent-soft: #10312f;
+  --color-accent-ink: #7ceee0;
+
+  --color-signal: #f0a952;
+  --color-signal-soft: #35260f;
+
+  --color-danger: #f87171;
+  --color-danger-soft: #3a1a1a;
+
+  --color-positive: #4ade80;
+  --color-negative: #f87171;
+
+  --color-band-slate: #78828e;
+  --color-band-sky: #5ba3e8;
+  --color-band-teal: #2dd4bf;
+  --color-band-amber: #e9b949;
+  --color-band-violet: #a78bfa;
+  --color-band-rose: #f0708f;
+}
+
+* {
+  border-color: var(--color-line);
+}
+
+html {
+  color-scheme: light;
+  scrollbar-gutter: stable;
+}
+html.dark {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--color-canvas);
+  color: var(--color-ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Money and dates line up in columns. Non-negotiable in a financial table. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+@utility card {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: 0.75rem;
+}
+
+@utility focus-ring {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+:where(a, button, input, select, textarea):focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 0.25rem;
+}
+
+/* Recharts inherits none of our tokens by default. */
+.recharts-cartesian-axis-tick text {
+  fill: var(--color-ink-3);
+  font-size: 11px;
+}
+.recharts-cartesian-grid line {
+  stroke: var(--color-line);
+}
+.recharts-tooltip-wrapper {
+  outline: none;
+}
+
+::selection {
+  background: var(--color-accent);
+  color: var(--color-surface);
+}
+
+/* Thin, unobtrusive scrollbars in dense tables. */
+@supports (scrollbar-width: thin) {
+  .scroll-thin {
+    scrollbar-width: thin;
+    scrollbar-color: var(--color-line-strong) transparent;
+  }
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+  body {
+    background: #fff;
+    color: #000;
+  }
+}
