@@ -10,7 +10,9 @@ import { recomputeAll } from "../src/lib/scoring/recompute";
 
 async function main() {
   const counts = await recomputeAll();
-  console.log(`Revalued ${counts.companies} companies and rescored ${counts.prospects} prospects.`);
+  console.log(
+    `Revalued ${counts.companies} companies, attributed ${counts.dividendsAttributed} new dividend record(s), and rescored ${counts.prospects} prospects.`,
+  );
 }
 
 main()

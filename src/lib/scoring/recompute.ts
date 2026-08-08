@@ -355,15 +355,30 @@ export async function snapshotProspects(): Promise<number> {
   return prospects.length;
 }
 
-/** Recompute the whole book. Used after a model change or a full ingest. */
-export async function recomputeAll(): Promise<{ companies: number; prospects: number }> {
+/**
+ * Recompute the whole book. Used after a model change or a full ingest.
+ *
+ * `attributeDividends` is imported lazily because the pipeline imports this
+ * module, and a static import would close the cycle.
+ */
+export async function recomputeAll(): Promise<{
+  companies: number;
+  prospects: number;
+  dividendsAttributed: number;
+}> {
+  const { attributeDividends } = await import("@/lib/ingest/pipeline");
+
   const companies = await prisma.company.findMany({ select: { id: true } });
-  for (const c of companies) await recomputeCompany(c.id);
+  let dividendsAttributed = 0;
+  for (const c of companies) {
+    await recomputeCompany(c.id);
+    dividendsAttributed += await attributeDividends(c.id);
+  }
 
   const prospects = await prisma.prospect.findMany({ select: { id: true } });
   for (const p of prospects) await recomputeProspect(p.id);
 
-  return { companies: companies.length, prospects: prospects.length };
+  return { companies: companies.length, prospects: prospects.length, dividendsAttributed };
 }
 
 const EVIDENCE_ORDER: EvidenceStrength[] = ["ASSERTED", "MODELLED", "REPORTED", "DISCLOSED", "FILED"];

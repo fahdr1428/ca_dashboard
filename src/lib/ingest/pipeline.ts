@@ -1,5 +1,6 @@
 import { prisma, toBigInt } from "@/lib/db";
 import { recomputeCompany, recomputeProspect, snapshotProspects } from "@/lib/scoring/recompute";
+import { deriveFinancialSignals } from "./derive-signals";
 import { isInScope } from "@/lib/regions";
 import { slugify } from "@/lib/utils";
 import { createCompaniesHouseConnector } from "./companies-house";
@@ -37,6 +38,7 @@ export interface IngestSummary {
     signalsCreated: number;
     prospectsRecomputed: number;
     snapshotsTaken: number;
+    dividendsAttributed: number;
   };
   warnings: string[];
   log: string[];
@@ -57,6 +59,7 @@ export async function runIngest(options: IngestOptions): Promise<IngestSummary> 
     signalsCreated: 0,
     prospectsRecomputed: 0,
     snapshotsTaken: 0,
+    dividendsAttributed: 0,
   };
 
   const connectors = allConnectors().filter(
@@ -136,12 +139,19 @@ export async function runIngest(options: IngestOptions): Promise<IngestSummary> 
     }
   }
 
-  // --- Recompute ------------------------------------------------------------
+  // --- Derive what the filed accounts imply ---------------------------------
+  // The register gives ownership and the accounts give the numbers, but the
+  // things an advisor actually acts on — who received a large dividend, which
+  // companies are growing fast — have to be derived from both. Without this
+  // step a live run produces companies with financials and prospects with no
+  // dividend history, which understates every estimate.
   for (const companyId of touchedCompanyIds) {
     try {
       await recomputeCompany(companyId);
+      stats.dividendsAttributed += await attributeDividends(companyId);
+      stats.signalsCreated += await deriveAndStoreFinancialSignals(companyId);
     } catch (err) {
-      warnings.push(`Valuation failed for company ${companyId}: ${errText(err)}`);
+      warnings.push(`Deriving company data failed for ${companyId}: ${errText(err)}`);
     }
   }
 
@@ -197,6 +207,102 @@ export async function runIngest(options: IngestOptions): Promise<IngestSummary> 
     log,
     durationMs: Date.now() - startedAt,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Derived company data
+// ---------------------------------------------------------------------------
+
+/**
+ * Splits each company's declared distributions across its known shareholders in
+ * proportion to their PSC band.
+ *
+ * The total is a filed fact; the split is a model, so the resulting rows are
+ * graded MODELLED rather than FILED. This is what the brief means by estimating
+ * personal wealth from dividends received — without it the dividend component
+ * of every live estimate is zero.
+ */
+export async function attributeDividends(companyId: string): Promise<number> {
+  const company = await prisma.company.findUnique({
+    where: { id: companyId },
+    include: {
+      financials: { where: { dividendsDeclaredGBP: { not: null } } },
+      shareholdings: { where: { isCurrent: true } },
+    },
+  });
+  if (!company?.shareholdings.length) return 0;
+
+  let created = 0;
+  for (const period of company.financials) {
+    const total = Number(period.dividendsDeclaredGBP ?? 0n);
+    if (total <= 0) continue;
+
+    for (const holding of company.shareholdings) {
+      const pctMid = (holding.ownershipPctLow + holding.ownershipPctHigh) / 2;
+      if (pctMid <= 0) continue;
+      const attributed = Math.round((total * pctMid) / 100);
+
+      const existing = await prisma.dividendPayment.findFirst({
+        where: { companyId, prospectId: holding.prospectId, periodEnd: period.periodEnd },
+      });
+      if (existing) {
+        await prisma.dividendPayment.update({
+          where: { id: existing.id },
+          data: { totalGBP: toBigInt(total), attributedGBP: toBigInt(attributed) },
+        });
+      } else {
+        await prisma.dividendPayment.create({
+          data: {
+            companyId,
+            prospectId: holding.prospectId,
+            periodEnd: period.periodEnd,
+            totalGBP: toBigInt(total),
+            attributedGBP: toBigInt(attributed),
+            // The distribution is filed; apportioning it by a banded holding
+            // is inference.
+            evidence: "MODELLED",
+          },
+        });
+        created++;
+      }
+    }
+  }
+  return created;
+}
+
+/** Large dividends, rapid growth and high margins, read out of filed accounts. */
+export async function deriveAndStoreFinancialSignals(companyId: string): Promise<number> {
+  const company = await prisma.company.findUnique({
+    where: { id: companyId },
+    include: { financials: { orderBy: { periodEnd: "desc" } } },
+  });
+  if (!company?.financials.length) return 0;
+
+  const signals = deriveFinancialSignals({
+    companyNumber: company.companyNumber,
+    companyName: company.name,
+    financials: company.financials.map((f) => ({
+      periodEnd: f.periodEnd,
+      revenueGBP: f.revenueGBP === null ? null : Number(f.revenueGBP),
+      ebitdaGBP: f.ebitdaGBP === null ? null : Number(f.ebitdaGBP),
+      pretaxProfitGBP: f.pretaxProfitGBP === null ? null : Number(f.pretaxProfitGBP),
+      netAssetsGBP: f.netAssetsGBP === null ? null : Number(f.netAssetsGBP),
+      cashGBP: f.cashGBP === null ? null : Number(f.cashGBP),
+      isAbridged: f.isAbridged,
+    })),
+    dividendsByPeriod: company.financials
+      .filter((f) => f.dividendsDeclaredGBP !== null)
+      .map((f) => ({ periodEnd: f.periodEnd, totalGBP: Number(f.dividendsDeclaredGBP) })),
+  });
+
+  let created = 0;
+  for (const raw of signals) {
+    // The company is already known, so point the signal straight at it rather
+    // than re-resolving by name.
+    const stored = await upsertSignal({ ...raw, companyNumber: company.companyNumber ?? undefined });
+    if (stored) created++;
+  }
+  return created;
 }
 
 // ---------------------------------------------------------------------------

@@ -5,12 +5,14 @@ import type {
   ConnectorResult,
   RawCompany,
   RawProspect,
+  RawFinancial,
   RawShareholding,
   RawSignal,
   RawSource,
 } from "./types";
 import { emptyResult } from "./types";
 import { sicToIndustry } from "./sic";
+import { parseIxbrlAccounts, deriveEbitda } from "./ixbrl";
 
 /**
  * Companies House connector.
@@ -65,7 +67,7 @@ class RateLimiter {
 }
 
 export class CompaniesHouseClient {
-  private limiter = new RateLimiter();
+  private readonly limiter = new RateLimiter();
   private requestCount = 0;
 
   constructor(
@@ -161,6 +163,49 @@ export class CompaniesHouseClient {
       items_per_page: 25,
     });
   }
+
+  /**
+   * Fetches a filed document's iXBRL content via the Document API.
+   *
+   * `documentMetadataUrl` comes from a filing history item's
+   * `links.document_metadata` and points at a different host, which `get()`
+   * handles because an absolute URL overrides the base. The metadata is checked
+   * first so we only request XHTML when the filing actually has it — accounts
+   * filed on paper are scanned PDFs with no tagged data, and asking for XHTML
+   * would just waste a request against the rate limit.
+   */
+  async accountsDocument(documentMetadataUrl: string): Promise<string | null> {
+    const metadata = await this.get<CHDocumentMetadata>(documentMetadataUrl);
+    const resources = metadata?.resources ?? {};
+    const xhtmlType = Object.keys(resources).find((t) => /xhtml|xml/i.test(t));
+    if (!xhtmlType) return null;
+
+    return this.getText(`${documentMetadataUrl.replace(/\/$/, "")}/content`, xhtmlType);
+  }
+
+  /** As `get`, but for non-JSON payloads. */
+  private async getText(url: string, accept: string): Promise<string | null> {
+    if (this.requestCount >= this.maxRequests) {
+      throw new Error(`Companies House request budget of ${this.maxRequests} exhausted`);
+    }
+    await this.limiter.take();
+    this.requestCount++;
+
+    const auth = Buffer.from(`${this.apiKey}:`).toString("base64");
+    const res = await fetch(url, {
+      headers: { Authorization: `Basic ${auth}`, Accept: accept },
+      redirect: "follow",
+    });
+    if (res.status === 404 || res.status === 410) return null;
+    if (!res.ok) return null;
+
+    // Guard against pulling a very large document into memory; tagged accounts
+    // for a company of this size are comfortably under this.
+    const length = Number(res.headers.get("content-length") ?? 0);
+    if (length > 12_000_000) return null;
+
+    return res.text();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,7 +284,14 @@ interface CHFilingHistory {
     description: string;
     type: string;
     transaction_id?: string;
+    links?: { document_metadata?: string };
   }>;
+}
+
+interface CHDocumentMetadata {
+  company_number?: string;
+  /** Keyed by content type, e.g. "application/xhtml+xml". */
+  resources?: Record<string, { content_length?: number }>;
 }
 
 // ---------------------------------------------------------------------------
@@ -415,6 +467,17 @@ export function createCompaniesHouseConnector(): Connector {
                   const signal = filingToSignal(item.company_number, item.company_name, f, occurredOn);
                   if (signal) result.signals.push(signal);
                 }
+
+                // The accounts are where the money is. Without them every
+                // valuation is zero and nobody qualifies, so this is the part
+                // that makes the wealth model work on live data.
+                const { financials, warnings } = await readFiledAccounts(
+                  client,
+                  filings.items,
+                  item.company_name,
+                );
+                if (financials.length) company.financials = financials;
+                result.warnings.push(...warnings);
               }
 
               // PSC register: the ownership evidence.
@@ -506,6 +569,79 @@ export function createCompaniesHouseConnector(): Connector {
       );
       return result;
     },
+  };
+}
+
+/** How many accounts filings to open per company. */
+const ACCOUNTS_FILINGS_TO_READ = 2;
+
+/**
+ * Downloads and parses the most recent filed accounts.
+ *
+ * Each iXBRL document carries the current year and its comparative, so two
+ * filings yield up to four years — enough for the revenue CAGR the growth
+ * signals and exit-potential model depend on. Reading more than that costs
+ * requests against the rate limit for diminishing returns.
+ */
+async function readFiledAccounts(
+  client: CompaniesHouseClient,
+  filings: Array<{ category: string; date: string; links?: { document_metadata?: string } }>,
+  companyName: string,
+): Promise<{ financials: RawFinancial[]; warnings: string[] }> {
+  const warnings: string[] = [];
+  const byPeriodEnd = new Map<string, RawFinancial>();
+
+  const accountsFilings = filings
+    .filter((f) => f.category === "accounts" && f.links?.document_metadata)
+    .slice(0, ACCOUNTS_FILINGS_TO_READ);
+
+  for (const filing of accountsFilings) {
+    try {
+      const document = await client.accountsDocument(filing.links!.document_metadata!);
+      if (!document) continue;
+
+      const parsed = parseIxbrlAccounts(document);
+      if (!parsed.periods.length) {
+        warnings.push(
+          `${companyName}: accounts filed ${filing.date} carry no tagged data (likely a scanned paper filing).`,
+        );
+        continue;
+      }
+
+      for (const period of parsed.periods) {
+        const key = period.periodEnd.toISOString().slice(0, 10);
+        // The newest filing wins: a later filing may restate an earlier year.
+        if (byPeriodEnd.has(key)) continue;
+        byPeriodEnd.set(key, {
+          periodEnd: period.periodEnd,
+          periodLabel: `FY${String(period.periodEnd.getUTCFullYear()).slice(2)}`,
+          revenueGBP: period.revenueGBP,
+          grossProfitGBP: period.grossProfitGBP,
+          ebitdaGBP: deriveEbitda(document, period),
+          pretaxProfitGBP: period.pretaxProfitGBP,
+          netAssetsGBP: period.netAssetsGBP,
+          cashGBP: period.cashGBP,
+          employees: period.employees,
+          dividendsDeclaredGBP: period.dividendsGBP,
+          isAbridged: period.isAbridged,
+          evidence: "FILED",
+        });
+      }
+    } catch (err) {
+      // One unreadable document must not abandon the company, let alone the run.
+      warnings.push(
+        `${companyName}: could not read accounts filed ${filing.date}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  return {
+    financials: [...byPeriodEnd.values()].sort(
+      (a, b) => a.periodEnd.getTime() - b.periodEnd.getTime(),
+    ),
+    warnings,
   };
 }
 

@@ -15,7 +15,19 @@ export async function middleware(request: NextRequest) {
     return NextResponse.json({ error: "Unauthorised" }, { status: 401 });
   }
 
-  const session = await verifySessionToken(request.cookies.get(SESSION_COOKIE)?.value);
+  // A misconfigured AUTH_SECRET would throw here on every request, taking the
+  // whole app down with an opaque error instead of a diagnosable one.
+  let session = null;
+  try {
+    session = await verifySessionToken(request.cookies.get(SESSION_COOKIE)?.value);
+  } catch {
+    if (pathname.startsWith("/api/")) {
+      return NextResponse.json(
+        { error: "Server misconfigured: AUTH_SECRET is missing or too short." },
+        { status: 500 },
+      );
+    }
+  }
   if (session) return NextResponse.next();
 
   if (pathname.startsWith("/api/")) {

@@ -110,6 +110,7 @@ const FILING_HISTORY = {
       description: "accounts-with-accounts-type-full",
       type: "AA",
       transaction_id: "TX1",
+      links: { document_metadata: "https://document-api.company-information.service.gov.uk/document/DOC1" },
     },
     {
       category: "persons-with-significant-control",
@@ -128,6 +129,30 @@ const FILING_HISTORY = {
   ],
 };
 
+/** Document API metadata: declares which content types the filing has. */
+const DOC_METADATA = {
+  company_number: "07890123",
+  resources: { "application/xhtml+xml": { content_length: 84000 }, "application/pdf": {} },
+};
+
+/** A minimal but realistic iXBRL accounts document. */
+const ACCOUNTS_IXBRL = `<html xmlns:ix="http://www.xbrl.org/2013/inlineXBRL" xmlns:xbrli="http://www.xbrl.org/2003/instance">
+<ix:header><ix:resources>
+  <xbrli:context id="D26"><xbrli:period><xbrli:startDate>2025-04-01</xbrli:startDate><xbrli:endDate>2026-03-31</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:context id="D25"><xbrli:period><xbrli:startDate>2024-04-01</xbrli:startDate><xbrli:endDate>2025-03-31</xbrli:endDate></xbrli:period></xbrli:context>
+  <xbrli:context id="I26"><xbrli:period><xbrli:instant>2026-03-31</xbrli:instant></xbrli:period></xbrli:context>
+</ix:resources></ix:header><body>
+  <ix:nonFraction name="core:TurnoverRevenue" contextRef="D26" unitRef="GBP" scale="0">61,200,000</ix:nonFraction>
+  <ix:nonFraction name="core:TurnoverRevenue" contextRef="D25" unitRef="GBP" scale="0">52,400,000</ix:nonFraction>
+  <ix:nonFraction name="core:OperatingProfitLoss" contextRef="D26" unitRef="GBP" scale="0">8,300,000</ix:nonFraction>
+  <ix:nonFraction name="core:DepreciationAmortisationImpairmentExpense" contextRef="D26" unitRef="GBP" scale="0">1,150,000</ix:nonFraction>
+  <ix:nonFraction name="core:ProfitLossOnOrdinaryActivitiesBeforeTax" contextRef="D26" unitRef="GBP" scale="0">7,956,000</ix:nonFraction>
+  <ix:nonFraction name="core:DividendsPaid" contextRef="D26" unitRef="GBP" scale="0" sign="-">3,300,000</ix:nonFraction>
+  <ix:nonFraction name="core:NetAssetsLiabilities" contextRef="I26" unitRef="GBP" scale="0">33,000,000</ix:nonFraction>
+  <ix:nonFraction name="core:CashBankOnHand" contextRef="I26" unitRef="GBP" scale="0">7,800,000</ix:nonFraction>
+  <ix:nonFraction name="core:AverageNumberEmployeesDuringPeriod" contextRef="D26" unitRef="pure">380</ix:nonFraction>
+</body></html>`;
+
 /** Routes a request path to the matching fixture, like the real API would. */
 function fixtureFor(pathname: string, search: URLSearchParams): unknown {
   if (pathname === "/advanced-search/companies") {
@@ -141,6 +166,7 @@ function fixtureFor(pathname: string, search: URLSearchParams): unknown {
   if (pathname.endsWith("/persons-with-significant-control")) return PSC;
   if (pathname.endsWith("/officers")) return OFFICERS;
   if (pathname.endsWith("/filing-history")) return FILING_HISTORY;
+  if (pathname === "/document/DOC1") return DOC_METADATA;
   return null;
 }
 
@@ -161,6 +187,13 @@ function installFakeApi(options: { failWith?: number } = {}) {
 
     if (options.failWith) {
       return new Response("upstream error", { status: options.failWith });
+    }
+
+    if (url.pathname === "/document/DOC1/content") {
+      return new Response(ACCOUNTS_IXBRL, {
+        status: 200,
+        headers: { "Content-Type": "application/xhtml+xml" },
+      });
     }
 
     const body = fixtureFor(url.pathname, url.searchParams);
@@ -272,6 +305,53 @@ describe("Companies House connector", () => {
     // Dedupe keys must be stable so a re-run updates rather than duplicates.
     assert.equal(new Set(result.signals.map((s) => s.dedupeKey)).size, result.signals.length);
     assert.ok(result.signals.every((s) => s.dedupeKey.startsWith("ch:07890123:")));
+  });
+
+  // Without this the register gives us ownership but no money, every valuation
+  // comes out at zero, and the whole pipeline is inert on live data.
+  test("reads filed accounts from the Document API into financials", async () => {
+    installFakeApi();
+    const connector = createCompaniesHouseConnector();
+    const result = await connector.run({ since: null, maxRequests: 200, log: () => {} });
+
+    const financials = result.companies[0].financials ?? [];
+    assert.equal(financials.length, 2, "current year plus the comparative");
+
+    // Oldest first, as the valuation model expects.
+    assert.equal(financials[0].periodEnd.toISOString().slice(0, 10), "2025-03-31");
+    const latest = financials[1];
+    assert.equal(latest.periodEnd.toISOString().slice(0, 10), "2026-03-31");
+    assert.equal(latest.periodLabel, "FY26");
+    assert.equal(latest.revenueGBP, 61_200_000);
+    assert.equal(latest.pretaxProfitGBP, 7_956_000);
+    assert.equal(latest.netAssetsGBP, 33_000_000);
+    assert.equal(latest.cashGBP, 7_800_000);
+    assert.equal(latest.employees, 380);
+    assert.equal(latest.isAbridged, false);
+    assert.equal(latest.evidence, "FILED");
+    // Dividends are what drive the largest-recipient panel and the wealth model.
+    assert.equal(latest.dividendsDeclaredGBP, 3_300_000);
+    // EBITDA is derived by adding depreciation back to operating profit.
+    assert.equal(latest.ebitdaGBP, 8_300_000 + 1_150_000);
+  });
+
+  test("does not request XHTML when a filing has no tagged version", async () => {
+    installFakeApi();
+    // Strip the xhtml resource so only a scanned PDF remains.
+    const original = DOC_METADATA.resources;
+    (DOC_METADATA as { resources: unknown }).resources = { "application/pdf": {} };
+    try {
+      const result = await createCompaniesHouseConnector().run({
+        since: null, maxRequests: 200, log: () => {},
+      });
+      assert.equal(result.companies[0].financials, undefined);
+      assert.ok(
+        !calls.some((c) => c.pathname.endsWith("/content")),
+        "must not fetch content when no XHTML resource is offered",
+      );
+    } finally {
+      (DOC_METADATA as { resources: unknown }).resources = original;
+    }
   });
 
   test("skips filings older than the incremental cutoff", async () => {
