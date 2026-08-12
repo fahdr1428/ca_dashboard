@@ -11,6 +11,8 @@ import { formatDate } from "@/lib/utils";
 import { revenueCagr, pretaxMargin } from "@/lib/scoring/valuation";
 import { SIGNAL_LABELS, CORPORATE_EVENT_LABELS, EVIDENCE_LABELS, SOURCE_TYPE_LABELS } from "@/lib/signal-labels";
 import { companiesHouseCompanyUrl } from "@/lib/ingest/linkedin";
+import { gradeCompanyFacts, summariseVerification, FACT_LABELS, type CompanyFactKey } from "@/lib/verification";
+import { FactRow, VerificationBadge } from "@/components/fact";
 
 export const dynamic = "force-dynamic";
 
@@ -61,6 +63,26 @@ export default async function CompanyDetailPage({
   }));
 
   const valuationMid = Number(company.estValuationMidGBP ?? 0n);
+
+  const latestFiled = [...company.financials].reverse()[0];
+  const facts = gradeCompanyFacts({
+    companyNumber: company.companyNumber,
+    latestPeriodEnd: latestFiled?.periodEnd ?? null,
+    isAbridged: latestFiled?.isAbridged ?? false,
+    hasAnyAccounts: company.financials.length > 0,
+    revenueGBP: latestFiled?.revenueGBP ? Number(latestFiled.revenueGBP) : null,
+    pretaxProfitGBP: latestFiled?.pretaxProfitGBP ? Number(latestFiled.pretaxProfitGBP) : null,
+    netAssetsGBP: latestFiled?.netAssetsGBP ? Number(latestFiled.netAssetsGBP) : null,
+    cashGBP: latestFiled?.cashGBP ? Number(latestFiled.cashGBP) : null,
+    dividendsGBP: latestFiled?.dividendsDeclaredGBP ? Number(latestFiled.dividendsDeclaredGBP) : null,
+    valuationMidGBP: valuationMid,
+    valuationMethod: company.valuationMethod,
+    valuationBasisIsTransaction: company.fundingRounds.length > 0,
+  });
+  const verification = summariseVerification(facts);
+  const FACT_ORDER: CompanyFactKey[] = [
+    "revenue", "pretaxProfit", "netAssets", "cash", "dividends", "valuation",
+  ];
 
   return (
     <>
@@ -142,6 +164,25 @@ export default async function CompanyDetailPage({
               {company.exitRationale}
             </p>
           )}
+        </Card>
+
+        <Card>
+          <CardHeader
+            title="What is on the public record"
+            subtitle="Which of these figures is a filed fact, which this system derived, and — where a figure is missing — why it is not available."
+            action={<VerificationBadge verification={verification} />}
+          />
+          <div className="px-5 pb-4">
+            <p className="text-[12px] text-ink-2 leading-relaxed mb-2">{verification.summary}</p>
+            {FACT_ORDER.map((key) => (
+              <FactRow
+                key={key}
+                label={FACT_LABELS[key]}
+                value={facts[key].value}
+                provenance={facts[key].provenance}
+              />
+            ))}
+          </div>
         </Card>
 
         <div className="grid gap-4 xl:grid-cols-[1.5fr_1fr] items-start">

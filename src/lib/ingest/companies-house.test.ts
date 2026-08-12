@@ -354,6 +354,39 @@ describe("Companies House connector", () => {
     }
   });
 
+  // A key registered only for the Public Data API cannot read filed accounts.
+  // That must be reported as the configuration problem it is, once, and not
+  // mistaken for every company having filed on paper.
+  test("reports a Document API authorisation failure clearly and only once", async () => {
+    calls = [];
+    globalThis.fetch = (async (input: string | URL) => {
+      const url = new URL(input.toString());
+      calls.push({ pathname: url.pathname, authorization: null });
+      if (url.pathname.startsWith("/document/")) {
+        return new Response("Forbidden", { status: 403 });
+      }
+      const body = fixtureFor(url.pathname, url.searchParams);
+      if (body === null) return new Response("Not Found", { status: 404 });
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const result = await createCompaniesHouseConnector().run({
+      since: null, maxRequests: 200, log: () => {},
+    });
+
+    const authWarnings = result.warnings.filter((w) => /Document API/.test(w));
+    assert.equal(authWarnings.length, 1, "reported exactly once, not per company");
+    assert.match(authWarnings[0], /separate product/);
+    assert.match(authWarnings[0], /developer\.company-information\.service\.gov\.uk/);
+    // The rest of the record still lands — ownership does not depend on accounts.
+    assert.equal(result.companies.length, 1);
+    assert.equal(result.prospects.length, 1);
+    assert.equal(result.companies[0].financials, undefined);
+  });
+
   test("skips filings older than the incremental cutoff", async () => {
     installFakeApi();
     const connector = createCompaniesHouseConnector();

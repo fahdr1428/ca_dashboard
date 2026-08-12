@@ -174,13 +174,33 @@ export class CompaniesHouseClient {
    * filed on paper are scanned PDFs with no tagged data, and asking for XHTML
    * would just waste a request against the rate limit.
    */
-  async accountsDocument(documentMetadataUrl: string): Promise<string | null> {
-    const metadata = await this.get<CHDocumentMetadata>(documentMetadataUrl);
-    const resources = metadata?.resources ?? {};
-    const xhtmlType = Object.keys(resources).find((t) => /xhtml|xml/i.test(t));
-    if (!xhtmlType) return null;
+  async accountsDocument(
+    documentMetadataUrl: string,
+  ): Promise<{ content: string | null; reason: DocumentSkipReason | null }> {
+    let metadata: CHDocumentMetadata | null;
+    try {
+      metadata = await this.get<CHDocumentMetadata>(documentMetadataUrl);
+    } catch (err) {
+      // A 401/403 here means the key is not authorised for the Document API,
+      // which is a separate product from the Public Data API. That is a
+      // configuration problem with a specific fix, and it must not be reported
+      // as "this company filed on paper".
+      const message = err instanceof Error ? err.message : String(err);
+      if (/\b40[13]\b/.test(message)) return { content: null, reason: "NOT_AUTHORISED" };
+      throw err;
+    }
 
-    return this.getText(`${documentMetadataUrl.replace(/\/$/, "")}/content`, xhtmlType);
+    if (!metadata) return { content: null, reason: "NO_DOCUMENT" };
+
+    const resources = metadata.resources ?? {};
+    const xhtmlType = Object.keys(resources).find((t) => /xhtml|xml/i.test(t));
+    if (!xhtmlType) return { content: null, reason: "NO_TAGGED_VERSION" };
+
+    const content = await this.getText(
+      `${documentMetadataUrl.replace(/\/$/, "")}/content`,
+      xhtmlType,
+    );
+    return { content, reason: content ? null : "CONTENT_UNAVAILABLE" };
   }
 
   /** As `get`, but for non-JSON payloads. */
@@ -287,6 +307,12 @@ interface CHFilingHistory {
     links?: { document_metadata?: string };
   }>;
 }
+
+export type DocumentSkipReason =
+  | "NOT_AUTHORISED"
+  | "NO_DOCUMENT"
+  | "NO_TAGGED_VERSION"
+  | "CONTENT_UNAVAILABLE";
 
 interface CHDocumentMetadata {
   company_number?: string;
@@ -413,6 +439,10 @@ export function createCompaniesHouseConnector(): Connector {
       let consecutiveFailures = 0;
       const FAILURE_LIMIT = 2;
 
+      // Set once if the key cannot reach the Document API, so the remaining
+      // companies skip the attempt instead of failing identically.
+      let documentApiBlocked = false;
+
       for (const location of locations) {
         let page = 0;
         try {
@@ -471,13 +501,24 @@ export function createCompaniesHouseConnector(): Connector {
                 // The accounts are where the money is. Without them every
                 // valuation is zero and nobody qualifies, so this is the part
                 // that makes the wealth model work on live data.
-                const { financials, warnings } = await readFiledAccounts(
-                  client,
-                  filings.items,
-                  item.company_name,
-                );
-                if (financials.length) company.financials = financials;
-                result.warnings.push(...warnings);
+                if (!documentApiBlocked) {
+                  try {
+                    const { financials, warnings } = await readFiledAccounts(
+                      client,
+                      filings.items,
+                      item.company_name,
+                    );
+                    if (financials.length) company.financials = financials;
+                    result.warnings.push(...warnings);
+                  } catch (err) {
+                    if (err instanceof DocumentApiUnauthorised) {
+                      documentApiBlocked = true;
+                      result.warnings.push(err.message);
+                    } else {
+                      throw err;
+                    }
+                  }
+                }
               }
 
               // PSC register: the ownership evidence.
@@ -575,6 +616,26 @@ export function createCompaniesHouseConnector(): Connector {
 /** How many accounts filings to open per company. */
 const ACCOUNTS_FILINGS_TO_READ = 2;
 
+/** Thrown once when the API key cannot reach the Document API at all. */
+class DocumentApiUnauthorised extends Error {
+  constructor() {
+    super(
+      "Companies House rejected the Document API request (401/403). Filed accounts cannot be read, " +
+        "so turnover, profit and dividends will be unavailable and valuations will fall back to net assets. " +
+        "The Document API is a separate product from the Public Data API — check that your application at " +
+        "developer.company-information.service.gov.uk is registered for it, and that you are using the REST key rather than a streaming key.",
+    );
+    this.name = "DocumentApiUnauthorised";
+  }
+}
+
+const SKIP_REASONS: Record<string, string> = {
+  NO_DOCUMENT: "the accounts filing has no retrievable document.",
+  NO_TAGGED_VERSION:
+    "accounts were filed on paper or as a scanned PDF, so no machine-readable figures are available.",
+  CONTENT_UNAVAILABLE: "the accounts document could not be downloaded.",
+};
+
 /**
  * Downloads and parses the most recent filed accounts.
  *
@@ -597,8 +658,19 @@ async function readFiledAccounts(
 
   for (const filing of accountsFilings) {
     try {
-      const document = await client.accountsDocument(filing.links!.document_metadata!);
-      if (!document) continue;
+      const { content: document, reason } = await client.accountsDocument(
+        filing.links!.document_metadata!,
+      );
+
+      if (!document) {
+        if (reason === "NOT_AUTHORISED") {
+          // Report once and stop trying — every subsequent company will fail
+          // the same way.
+          throw new DocumentApiUnauthorised();
+        }
+        warnings.push(`${companyName}: ${SKIP_REASONS[reason ?? "NO_DOCUMENT"]}`);
+        continue;
+      }
 
       const parsed = parseIxbrlAccounts(document);
       if (!parsed.periods.length) {
@@ -628,6 +700,9 @@ async function readFiledAccounts(
         });
       }
     } catch (err) {
+      // A Document API authorisation failure is systemic — let it propagate so
+      // the connector reports it once rather than once per company.
+      if (err instanceof DocumentApiUnauthorised) throw err;
       // One unreadable document must not abandon the company, let alone the run.
       warnings.push(
         `${companyName}: could not read accounts filed ${filing.date}: ${
