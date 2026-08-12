@@ -1,0 +1,15 @@
+# Executive palette: dark slate with a single teal accent for money.
+[theme]
+base = "dark"
+primaryColor = "#2dd4bf"
+backgroundColor = "#0e1116"
+secondaryBackgroundColor = "#161a21"
+textColor = "#e8eaed"
+font = "sans serif"
+
+[server]
+headless = true
+fileWatcherType = "none"
+
+[browser]
+gatherUsageStats = false

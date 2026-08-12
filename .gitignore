@@ -9,3 +9,14 @@ next-env.d.ts
 src/generated/
 data/eng_lad_topo.json
 .DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Research app database (local data, not source)
+wealthscan.db
+*.db-journal
+research.log

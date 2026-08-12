@@ -1,0 +1,8 @@
+# Wealth Advisor Lead Intelligence — research app
+#
+# Deliberately small. No database server, no API keys required to start, and
+# nothing that needs compiling.
+streamlit>=1.40
+pandas>=2.2
+altair>=5.4
+requests>=2.32

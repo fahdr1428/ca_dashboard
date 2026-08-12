@@ -32,7 +32,25 @@ doing its job.
 
 ---
 
-## Quick start
+## Two apps in this repo
+
+| | **Research app** (Streamlit, Python) | **Dashboard** (Next.js, TypeScript) |
+| --- | --- | --- |
+| **Finds prospects by** | Searching public news weekly — 182 targeted queries across the 13 counties | Reading the Companies House register and filed accounts |
+| **Needs** | `pip install` and one command | Postgres, a build step, a deployment |
+| **Companies House** | Optional bonus — verifies an assumed stake | Required; it is the whole data source |
+| **Start with** | `streamlit run streamlit_app.py` | `npm run setup && npm run dev` |
+| **Docs** | **[RESEARCH_APP.md](RESEARCH_APP.md)** | this file |
+
+If you want prospects discovered from news with no infrastructure to set up,
+use the **research app**. If you want ownership and financials verified against
+the statutory register, use the **Next.js dashboard**. They share the same 13
+counties, the same thresholds, and the same rule that an estimate is never
+presented as a fact.
+
+---
+
+## Quick start (Next.js dashboard)
 
 You need Node 20+ and a PostgreSQL 14+ database. If you have Docker, the
 database is one command; otherwise point `DATABASE_URL` at your own instance.
