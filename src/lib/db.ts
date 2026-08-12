@@ -16,9 +16,23 @@ function createClient(): PrismaClient {
   });
 }
 
-export const prisma = globalForPrisma.prisma ?? createClient();
-
-if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+/**
+ * Constructed lazily, on the first query rather than on import.
+ *
+ * `next build` imports every route module to collect page data. If creating the
+ * client happened at import time, a deployment without DATABASE_URL set yet
+ * would fail the *build* — which is exactly when you most want it to succeed, so
+ * that the app can come up and tell you what configuration is missing. Deferring
+ * construction means a missing connection string surfaces as a handled runtime
+ * error on the setup screen instead of an opaque build failure.
+ */
+export const prisma: PrismaClient = new Proxy({} as PrismaClient, {
+  get(_target, property, receiver) {
+    const client = (globalForPrisma.prisma ??= createClient());
+    const value = Reflect.get(client as object, property, receiver);
+    return typeof value === "function" ? value.bind(client) : value;
+  },
+});
 
 /**
  * Prisma returns BigInt for money columns, which `JSON.stringify` refuses to
