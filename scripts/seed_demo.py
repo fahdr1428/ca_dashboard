@@ -20,10 +20,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import json  # noqa: E402
+
 from wealthscan import db  # noqa: E402
 from wealthscan.extract import extract_event  # noqa: E402
 from wealthscan.report import generate_and_store  # noqa: E402
 from wealthscan.research import _store_event  # noqa: E402
+from wealthscan.scoring import cohort_for, estimate_from_event, score_confidence  # noqa: E402
 from wealthscan.sources import Fetcher  # noqa: E402
 
 NOW = datetime.now(timezone.utc)
@@ -129,6 +132,65 @@ ARTICLES: list[tuple[str, str, str, int, str | None]] = [
 ]
 
 
+def verify_demo_record(
+    *, name: str, company_number: str, officer_name: str, ownership_band: str,
+    amount_gbp: int, publisher: str,
+) -> None:
+    """Apply a Companies House verification the way a real run would."""
+    estimate = estimate_from_event(
+        event_key="business_exit",
+        amount_gbp=amount_gbp,
+        text="sold the business",
+        has_named_person=True,
+        known_stake_band=ownership_band,
+    )
+    confidence = score_confidence(
+        publisher=publisher, has_named_person=True, amount_disclosed=True,
+        source_count=1, event_weight=95,
+        stake_verified=True, companies_house_verified=True,
+    )
+
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT id FROM prospects WHERE full_name = ?", (name,)
+        ).fetchone()
+        if not row:
+            return
+        conn.execute(
+            """UPDATE prospects SET
+                   ch_company_number = ?, ch_officer_name = ?, ch_ownership_band = ?,
+                   ch_verified_at = ?,
+                   gross_low_gbp = ?, gross_mid_gbp = ?, gross_high_gbp = ?,
+                   investable_low_gbp = ?, investable_mid_gbp = ?, investable_high_gbp = ?,
+                   wealth_band = ?, cohort = ?, estimate_method = ?, estimate_caveats = ?,
+                   confidence = ?, confidence_band = ?, confidence_detail = ?,
+                   next_action = ?, last_updated = ?
+               WHERE id = ?""",
+            (
+                company_number, officer_name, ownership_band, db.now_iso(),
+                estimate.gross_low_gbp, estimate.gross_mid_gbp, estimate.gross_high_gbp,
+                estimate.investable_low_gbp, estimate.investable_mid_gbp,
+                estimate.investable_high_gbp,
+                estimate.band,
+                cohort_for(estimate.investable_mid_gbp, estimate.gross_mid_gbp),
+                estimate.method, json.dumps(estimate.caveats),
+                confidence.score, confidence.band,
+                json.dumps([
+                    {"label": d.label, "score": d.score, "weight": d.weight, "why": d.explanation}
+                    for d in confidence.dimensions
+                ]),
+                confidence.next_action, db.now_iso(), row["id"],
+            ),
+        )
+        db.add_event(
+            conn, int(row["id"]), "verified",
+            f"Shareholding confirmed on the Companies House PSC register: "
+            f"{ownership_band} of Halberton Precision Engineering Ltd. The estimate "
+            f"has been re-derived from the filed band.",
+            f"https://find-and-update.company-information.service.gov.uk/company/{company_number}",
+        )
+
+
 def main() -> int:
     db.init_db()
     fetcher = Fetcher(delay=0.0)  # nothing is fetched; the articles are inline
@@ -162,25 +224,20 @@ def main() -> int:
             print(f"  · company-level lead only (no individual named): {title[:50]}")
 
     # One record verified against Companies House, so the difference between an
-    # assumed stake and a filed one is visible in the UI.
+    # assumed stake and a filed one is visible in the UI. The estimate is
+    # *recomputed* with the filed band rather than patched — otherwise the record
+    # would claim the stake is confirmed while still showing a figure derived
+    # from the assumption, and its caveats would contradict its own header.
+    verify_demo_record(
+        name="Gareth Halberton",
+        company_number="07890123",
+        officer_name="HALBERTON, Gareth John",
+        ownership_band="50–75%",
+        amount_gbp=64_000_000,
+        publisher="BusinessLive South West",
+    )
+
     with db.connect() as conn:
-        row = conn.execute(
-            "SELECT id FROM prospects WHERE full_name = 'Gareth Halberton'"
-        ).fetchone()
-        if row:
-            conn.execute(
-                """UPDATE prospects SET ch_company_number = ?, ch_officer_name = ?,
-                       ch_ownership_band = ?, ch_verified_at = ?, confidence = ?,
-                       confidence_band = ?
-                   WHERE id = ?""",
-                ("07890123", "HALBERTON, Gareth John", "50–75%", db.now_iso(), 84, "High", row["id"]),
-            )
-            db.add_event(
-                conn, int(row["id"]), "verified",
-                "Shareholding confirmed on the Companies House PSC register: 50–75% of "
-                "Halberton Precision Engineering Ltd.",
-                "https://find-and-update.company-information.service.gov.uk/company/07890123",
-            )
 
         run_id = db.start_run(conn, "demo-seed")
         db.finish_run(

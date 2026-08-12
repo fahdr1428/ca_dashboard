@@ -298,3 +298,33 @@ class TestFormatting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestOwnershipBands(unittest.TestCase):
+    """A filed PSC band replaces the assumed stake, which is the single most
+    valuable thing verification does to a record."""
+
+    def test_parses_ranges_and_exact_values(self):
+        from wealthscan.scoring import parse_ownership_band
+        self.assertEqual(parse_ownership_band("50–75%"), (0.5, 0.625, 0.75))
+        self.assertEqual(parse_ownership_band("25–50%"), (0.25, 0.375, 0.5))
+        # A decimal must be read as one number, not two.
+        self.assertEqual(parse_ownership_band("12.5%"), (0.125, 0.125, 0.125))
+        self.assertIsNone(parse_ownership_band(None))
+        self.assertIsNone(parse_ownership_band("no numbers"))
+
+    def test_filed_band_changes_the_figure_and_the_caveat(self):
+        assumed = estimate_from_event(
+            event_key="business_exit", amount_gbp=64_000_000,
+            text="sold", has_named_person=True)
+        filed = estimate_from_event(
+            event_key="business_exit", amount_gbp=64_000_000,
+            text="sold", has_named_person=True, known_stake_band="50–75%")
+
+        self.assertIn("assumed to hold", assumed.method)
+        self.assertIn("filed PSC register", filed.method)
+        # The contradictory "stake is an assumption" caveat must be gone.
+        self.assertFalse(any("is an assumption" in c for c in filed.caveats))
+        self.assertTrue(any("is an assumption" in c for c in assumed.caveats))
+        # 62.5% filed midpoint beats the 55% default, so the figure moves up.
+        self.assertGreater(filed.gross_mid_gbp, assumed.gross_mid_gbp)

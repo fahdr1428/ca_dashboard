@@ -174,6 +174,8 @@ def _store_event(
         amount_gbp=event.amount_gbp,
         text=f"{event.title} {event.summary}",
         has_named_person=True,
+        # A filed PSC band replaces the assumed stake outright.
+        known_stake_band=ch_match.ownership_band if ch_match else None,
     )
 
     slug = db.slugify(f"{person.name}-{event.region}")

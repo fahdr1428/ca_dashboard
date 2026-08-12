@@ -13,6 +13,7 @@ number, rather than inventing one.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .config import MODEL, PRIORITY_THRESHOLD_GBP, QUALIFYING_THRESHOLD_GBP
@@ -92,14 +93,38 @@ def _founder_share_for_stage(text: str) -> tuple[float, str]:
     return MODEL.founder_share_after_series_a, "an unspecified round"
 
 
+def parse_ownership_band(band: str | None) -> tuple[float, float, float] | None:
+    """Turn a filed PSC band like "50–75%" into low/mid/high fractions."""
+    if not band:
+        return None
+    # Decimals must be matched whole: r"\d+" reads "12.5%" as two numbers (12
+    # and 5) and would report a band of 12%–5%.
+    numbers = re.findall(r"\d+(?:\.\d+)?", band)
+    if len(numbers) >= 2:
+        low, high = float(numbers[0]) / 100, float(numbers[1]) / 100
+        if high < low:
+            low, high = high, low
+        return low, (low + high) / 2, high
+    if len(numbers) == 1:
+        exact = float(numbers[0]) / 100
+        return exact, exact, exact
+    return None
+
+
 def estimate_from_event(
     *,
     event_key: str,
     amount_gbp: int | None,
     text: str,
     has_named_person: bool,
+    known_stake_band: str | None = None,
 ) -> Estimate:
-    """Estimate an individual's position from one reported event."""
+    """Estimate an individual's position from one reported event.
+
+    ``known_stake_band`` is a filed PSC band such as "50–75%". When supplied it
+    replaces the assumed shareholding — which removes the single largest source
+    of error, and means the output must no longer describe the stake as assumed.
+    """
 
     none_estimate = lambda reason: Estimate(  # noqa: E731 - terse by design
         None, None, None, None, None, None,
@@ -131,11 +156,15 @@ def estimate_from_event(
 
     # --- Realised: money has actually changed hands ------------------------
     if event_key in REALISED_EVENTS:
-        lows, mids, highs = (
-            MODEL.assumed_founder_stake_low,
-            MODEL.assumed_founder_stake_mid,
-            MODEL.assumed_founder_stake_high,
-        )
+        filed = parse_ownership_band(known_stake_band)
+        if filed:
+            lows, mids, highs = filed
+        else:
+            lows, mids, highs = (
+                MODEL.assumed_founder_stake_low,
+                MODEL.assumed_founder_stake_mid,
+                MODEL.assumed_founder_stake_high,
+            )
         after_tax = 1 - MODEL.exit_tax_rate
         gross_low = int(amount_gbp * lows * after_tax)
         gross_mid = int(amount_gbp * mids * after_tax)
@@ -153,15 +182,30 @@ def estimate_from_event(
             band=band_for(inv_mid),
             method=(
                 f"{_fmt(amount_gbp)} reported transaction value, of which the named "
-                f"individual is assumed to hold {mids:.0%} (range {lows:.0%}–{highs:.0%}), "
-                f"less {MODEL.exit_tax_rate:.0%} capital gains tax, of which "
-                f"{retention:.0%} is assumed retained rather than spent."
+                + (
+                    f"individual holds {lows:.0%}–{highs:.0%} per the filed PSC register "
+                    f"(midpoint {mids:.0%} used)"
+                    if filed
+                    else f"individual is assumed to hold {mids:.0%} "
+                         f"(range {lows:.0%}–{highs:.0%})"
+                )
+                + f", less {MODEL.exit_tax_rate:.0%} capital gains tax, of which "
+                  f"{retention:.0%} is assumed retained rather than spent."
             ),
-            caveats=[
-                "The individual's actual shareholding is not stated in the source. "
-                "The stake is an assumption and is the single largest source of error "
-                "in this figure — verify it on the Companies House PSC register before "
-                "relying on it.",
+            caveats=(
+                [
+                    "The shareholding is taken from the filed PSC register, so the "
+                    "largest source of error is removed. The band is 25 points wide, "
+                    "so its midpoint is still an approximation.",
+                ]
+                if filed
+                else [
+                    "The individual's actual shareholding is not stated in the source. "
+                    "The stake is an assumption and is the single largest source of error "
+                    "in this figure — verify it on the Companies House PSC register before "
+                    "relying on it.",
+                ]
+            ) + [
                 "Reported transaction values often include debt, deferred "
                 "consideration or earn-outs that never reach the seller.",
             ],
