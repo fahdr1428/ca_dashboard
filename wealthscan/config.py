@@ -32,7 +32,9 @@ USER_AGENT = os.environ.get(
     "WealthAdvisorLeadIntelligence/2.0 (research; +contact: set WEALTHSCAN_CONTACT)",
 )
 REQUEST_TIMEOUT_SECONDS = 20
-REQUEST_DELAY_SECONDS = float(os.environ.get("WEALTHSCAN_DELAY", "0.7"))
+# Google's RSS endpoint tolerates a steady rate; 0.5s keeps a full 182-query
+# sweep to roughly two minutes while staying well short of hammering anyone.
+REQUEST_DELAY_SECONDS = float(os.environ.get("WEALTHSCAN_DELAY", "0.5"))
 MAX_RETRIES = 3
 
 # --- Companies House (optional bonus, not required) ------------------------

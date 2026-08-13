@@ -252,6 +252,63 @@ def render_prospect_detail(row: pd.Series) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: The four events where money has genuinely changed hands. A first sweep uses
+#: only these, because they are the highest-yield patterns and 52 searches
+#: complete in about a minute rather than three.
+QUICK_EVENTS = ["business_exit", "acquisition", "management_buyout", "windfall"]
+
+
+def run_quick_sweep() -> None:
+    """A fast, high-yield first run, so a fresh install shows something quickly."""
+    status = st.status("Searching live news…", expanded=True)
+    bar = st.progress(0.0)
+
+    def report(message: str, fraction: float) -> None:
+        status.update(label=message)
+        bar.progress(min(1.0, fraction))
+
+    result = run_research(
+        trigger="quick-start",
+        days=30,
+        event_keys=QUICK_EVENTS,
+        include_publishers=False,
+        verify_companies_house=companies_house_available(),
+        progress=report,
+    )
+    status.update(label=f"Finished — {result.status}", state="complete")
+
+    if result.new_prospects:
+        generate_and_store()
+    refresh()
+
+    columns = st.columns(4)
+    columns[0].metric("Searches", result.queries_run)
+    columns[1].metric("Articles read", result.articles_seen)
+    columns[2].metric("Events kept", result.events_kept)
+    columns[3].metric("New prospects", result.new_prospects)
+
+    if result.new_prospects:
+        st.success(
+            f"Found {result.new_prospects} prospect(s). Reload the page, or open "
+            f"**Prospects** in the sidebar."
+        )
+    else:
+        st.warning(
+            "No prospects met the criteria in that window. That is a normal outcome "
+            "for a narrow first sweep — try **Run research** with all 14 event types "
+            "and a 30-day window, and include the regional publisher feeds."
+        )
+
+    if result.warnings:
+        with st.expander(f"{len(result.warnings)} source(s) could not be read"):
+            for warning in result.warnings:
+                st.text(warning)
+        st.caption(
+            "Some publishers block automated readers. A blocked feed simply means "
+            "that source contributed nothing this run."
+        )
+
+
 def page_overview(frame: pd.DataFrame) -> None:
     st.title("Overview")
     st.caption(
@@ -261,10 +318,20 @@ def page_overview(frame: pd.DataFrame) -> None:
 
     if frame.empty:
         st.info(
-            "**No prospects yet.** Open **Run research** in the sidebar and start a "
-            "sweep — it searches 182 targeted news queries across the 13 counties. "
-            "Or load the demo dataset with `python scripts/seed_demo.py` to see how "
-            "the dashboard works before running anything live."
+            "**No prospects yet.** The button below runs a first sweep against live "
+            "news — the four event types where money has actually changed hands "
+            "(business sold, acquired, management buyout, windfall) across all 13 "
+            "counties, looking back 30 days. That is 52 searches and takes about a "
+            "minute."
+        )
+        if st.button("Run a quick first sweep", type="primary"):
+            run_quick_sweep()
+            return
+        st.caption(
+            "For the full sweep — all 14 event types, 182 searches — use **Run "
+            "research** in the sidebar. To see how the dashboard looks before "
+            "running anything live, load the fictional demo data with "
+            "`python scripts/seed_demo.py`."
         )
         return
 
@@ -570,7 +637,12 @@ def page_run_research() -> None:
             "`COMPANIES_HOUSE_API_KEY` in your environment to enable it."
         )
 
-    if st.button("Start research sweep", type="primary"):
+    quick, full = st.columns([1, 1])
+    if quick.button("Quick sweep (52 searches, ~1 min)"):
+        run_quick_sweep()
+        return
+
+    if full.button("Start research sweep", type="primary"):
         status = st.status("Starting…", expanded=True)
         bar = st.progress(0.0)
 
