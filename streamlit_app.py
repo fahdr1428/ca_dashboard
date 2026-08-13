@@ -24,6 +24,7 @@ import streamlit as st
 
 from wealthscan import db
 from wealthscan.config import (
+    ANNUAL_INCOME_THRESHOLD_GBP,
     APP_NAME,
     APP_SUBTITLE,
     ASSUMPTION_NOTES,
@@ -537,26 +538,77 @@ SORTS = {
 }
 
 
+#: One-click answers to the questions an advisor actually opens the app with.
+#: Nine filter controls can express all of these; none of them should have to be
+#: reassembled every morning.
+QUICK_VIEWS: dict[str, str] = {
+    "Everyone": "",
+    "Call this week": "New arrivals that already clear £7.5m — the freshest actionable names.",
+    "£7.5m+ now": "Estimated investable assets over the qualifying threshold.",
+    "£1m+ a year": "Qualifying on income rather than assets — dividends and listed pay.",
+    "Land & estates": "Agricultural, estate and landowner wealth.",
+    "Filed evidence": "Only records whose strongest source is a statutory filing.",
+}
+
+
+def _apply_quick_view(frame: pd.DataFrame, view_name: str) -> pd.DataFrame:
+    if view_name == "Call this week":
+        return frame[
+            (frame["first_seen_week"] == db.iso_week())
+            & (frame["investable_mid_gbp"].fillna(0) >= QUALIFYING_THRESHOLD_GBP)
+        ]
+    if view_name == "£7.5m+ now":
+        return frame[frame["investable_mid_gbp"].fillna(0) >= QUALIFYING_THRESHOLD_GBP]
+    if view_name == "£1m+ a year":
+        return frame[frame["annual_income_gbp"].fillna(0) >= ANNUAL_INCOME_THRESHOLD_GBP]
+    if view_name == "Land & estates":
+        return frame[frame["wealth_source"].fillna("") == "Land, estate or farming"]
+    if view_name == "Filed evidence":
+        return frame[frame["evidence_grade"] == "High"]
+    return frame
+
+
 def _filters(frame: pd.DataFrame) -> pd.DataFrame:
-    """The filter bar. Everything is optional and nothing is preselected."""
-    with st.container(border=True):
-        top = st.columns([2.2, 1.4, 1.4, 1.5])
-        search = top[0].text_input(
-            "Search", placeholder="Name, company, town or address",
-        )
-        countries = top[1].multiselect(
+    """Search and quick views up front; the nine-control panel folded away.
+
+    The detailed filters were costing half the screen before any data appeared.
+    They are still one click down, but the common case — "show me who to ring" —
+    is now a single button.
+    """
+    head = st.columns([2.4, 3.2, 1.6])
+    search = head[0].text_input(
+        "Search", placeholder="Name, company, town or address", label_visibility="collapsed",
+    )
+    quick = head[1].segmented_control(
+        "Quick view", list(QUICK_VIEWS), default="Everyone",
+        label_visibility="collapsed",
+    ) or "Everyone"
+    sort_label = head[2].selectbox("Sort by", list(SORTS), label_visibility="collapsed")
+    if QUICK_VIEWS[quick]:
+        st.caption(QUICK_VIEWS[quick])
+
+    with st.expander("More filters"):
+        return _detailed_filters(frame, search=search, quick=quick, sort_label=sort_label)
+
+
+def _detailed_filters(
+    frame: pd.DataFrame, *, search: str, quick: str, sort_label: str
+) -> pd.DataFrame:
+    if True:
+        top = st.columns([1.4, 1.4, 1.5])
+        countries = top[0].multiselect(
             "Country", sorted(frame["country"].dropna().unique()), placeholder="Any country",
         )
-        groups = top[2].multiselect(
+        groups = top[1].multiselect(
             "Region", [g for g in GROUP_ORDER if g in set(frame["market_group"].dropna())],
             placeholder="Any region",
         )
-        sort_label = top[3].selectbox("Sort by", list(SORTS))
-
-        mid = st.columns([1.4, 1.3, 1.2, 1.2, 1.3])
-        markets = mid[0].multiselect(
+        markets_top = top[2].multiselect(
             "Market", sorted(frame["market_name"].dropna().unique()), placeholder="Any market",
         )
+
+        mid = st.columns([1.4, 1.3, 1.2, 1.2, 1.3])
+        markets = markets_top
         bands = mid[1].multiselect(
             "Wealth band", [b for b in BAND_ORDER if b in set(frame["wealth_band"])],
             placeholder="Any wealth band",
@@ -602,7 +654,7 @@ def _filters(frame: pd.DataFrame) -> pd.DataFrame:
             help="Only people matched to a filed officer or PSC record.",
         )
 
-    view = frame.copy()
+    view = _apply_quick_view(frame, quick).copy()
     if search:
         needle = search.lower()
         haystacks = ["full_name", "company", "locality", "market_name", "address",
@@ -676,13 +728,10 @@ def page_list(frame: pd.DataFrame) -> None:
         "Est. net worth £": pd.to_numeric(view["investable_mid_gbp"], errors="coerce"),
         "Co. revenue £": pd.to_numeric(view["company_revenue_gbp"], errors="coerce"),
         "Est. income £": pd.to_numeric(view["annual_income_gbp"], errors="coerce"),
-        "Band": view["wealth_band"],
         "Evidence": view["evidence_grade"].fillna("Low"),
         "Confidence": view["confidence"],
         "Wealth source": view["wealth_source"].fillna("—"),
-        "Adviser": view["known_adviser"].fillna(""),
         "Latest newsflow": view["latest_newsflow"].fillna(""),
-        "CH": view["ch_officer_name"].notna(),
         "Pipeline": view["status"],
         "Source": view["id"].map(lambda i: first_source(i, "url")),
     }).reset_index(drop=True)
@@ -720,7 +769,6 @@ def page_list(frame: pd.DataFrame) -> None:
                      "for listed-company pay; modelled from an assumed stake for "
                      "dividends. Blank means not publicly disclosed.",
             ),
-            "Band": st.column_config.TextColumn(width="small"),
             "Evidence": st.column_config.TextColumn(
                 "Evidence", width="small",
                 help="How direct the strongest source is. High = a statutory filing "
@@ -734,15 +782,7 @@ def page_list(frame: pd.DataFrame) -> None:
                      "a separate question from how wealthy the person is.",
             ),
             "Wealth source": st.column_config.TextColumn(width="medium"),
-            "Adviser": st.column_config.TextColumn(
-                "Adviser", width="small",
-                help="Only ever populated where an adviser relationship is publicly "
-                     "reported. Blank means unknown, not unadvised.",
-            ),
             "Latest newsflow": st.column_config.TextColumn(width="large"),
-            "CH": st.column_config.CheckboxColumn(
-                "CH ✓", help="Matched to a filed Companies House officer or PSC record.",
-            ),
             "Pipeline": st.column_config.TextColumn(width="small"),
             "Source": st.column_config.LinkColumn(
                 "Source", display_text="open", width="small",
