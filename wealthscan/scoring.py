@@ -16,18 +16,26 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from .config import MODEL, PRIORITY_THRESHOLD_GBP, QUALIFYING_THRESHOLD_GBP
+from .config import (
+    ANNUAL_INCOME_THRESHOLD_GBP,
+    MODEL,
+    PRIORITY_THRESHOLD_GBP,
+    QUALIFYING_THRESHOLD_GBP,
+)
 
 # Events where money has actually changed hands.
 REALISED_EVENTS = frozenset({
     "business_exit", "acquisition", "management_buyout", "windfall", "share_sale",
+    "land_sale",
 })
 # Events that value a stake without realising it.
 UNREALISED_EVENTS = frozenset({"venture_funding", "private_equity", "ipo"})
 # Events that indicate wealth but cannot size it.
 INDICATIVE_ONLY = frozenset({
-    "property", "family_office", "succession", "company_growth",
+    "property", "family_office", "succession", "company_growth", "landholding",
 })
+# Events that evidence recurring income rather than a capital position.
+INCOME_EVENTS = frozenset({"exec_comp", "large_dividend"})
 
 WEALTH_BANDS: tuple[tuple[str, int, int | None], ...] = (
     ("Below £7.5m", 0, 7_500_000),
@@ -67,6 +75,11 @@ class Estimate:
     is_realised: bool = False
     #: Set when no monetary estimate was possible, explaining why.
     not_estimated_reason: str | None = None
+    #: Recurring income — executive pay, or an attributable dividend. A separate
+    #: question from net worth: a listed-company executive on £2m a year may hold
+    #: very little liquid capital, and is a live planning need either way.
+    annual_income_gbp: int | None = None
+    annual_income_basis: str | None = None
 
 
 def _fmt(amount: float) -> str:
@@ -277,6 +290,36 @@ def estimate_from_event(
             is_realised=False,
         )
 
+    # --- Listed-company executive pay --------------------------------------
+    if event_key == "exec_comp":
+        # Uniquely among everything here, this figure is *disclosed*, not
+        # modelled: a remuneration report states the number. So it is recorded as
+        # income with no stake assumption, and no net-worth estimate is invented
+        # from it — a large salary says nothing reliable about accumulated
+        # capital.
+        return Estimate(
+            None, None, None, None, None, None,
+            band="Not estimated",
+            method="Income disclosed in a listed-company remuneration report.",
+            caveats=[
+                "This is annual remuneration, not net worth. Accumulated capital "
+                "is unknown and may be far smaller or far larger.",
+                "Reported packages usually include share awards that vest over "
+                "several years and may never vest at all.",
+            ],
+            not_estimated_reason=(
+                f"{_fmt(amount_gbp)} of annual remuneration is disclosed, which is "
+                f"income rather than assets. No net-worth figure is derived from it, "
+                f"because pay does not evidence accumulated capital. Check the "
+                f"director shareholdings table in the same annual report for that."
+            ),
+            annual_income_gbp=amount_gbp,
+            annual_income_basis=(
+                f"{_fmt(amount_gbp)} total remuneration as disclosed by the company. "
+                f"Stated, not modelled."
+            ),
+        )
+
     # --- Dividends ---------------------------------------------------------
     if event_key == "large_dividend":
         stake = MODEL.assumed_founder_stake_mid
@@ -298,6 +341,12 @@ def estimate_from_event(
                 "The shareholding split is assumed, not stated.",
             ],
             is_realised=True,
+            annual_income_gbp=int(amount_gbp * stake),
+            annual_income_basis=(
+                f"{_fmt(amount_gbp)} distributed, of which the named individual is "
+                f"assumed to receive {stake:.0%} — {_fmt(amount_gbp * stake)} before tax. "
+                f"The split is assumed, not stated."
+            ),
         )
 
     if event_key == "rich_list":
@@ -342,7 +391,7 @@ TRUSTED_PUBLISHERS = (
     "associated press", "ap news", "new york times",
     # Middle East
     "arabian business", "zawya", "gulf business", "the national", "arab news",
-    "khaleej times", "gulf news", "meed", "wamda", "globes", "calcalist",
+    "khaleej times", "gulf news", "meed", "wamda",
     # Europe and Asia-Pacific
     "handelsblatt", "les echos", "il sole", "expansión", "nikkei",
     "south china morning post", "scmp", "straits times", "the australian",
@@ -499,12 +548,24 @@ def score_confidence(
     )
 
 
-def cohort_for(investable_mid: int | None, gross_mid: int | None) -> str:
-    """Which pipeline cohort a prospect belongs to."""
+def cohort_for(
+    investable_mid: int | None,
+    gross_mid: int | None,
+    annual_income: int | None = None,
+) -> str:
+    """Which pipeline cohort a prospect belongs to.
+
+    Income qualifies independently of assets. An owner-manager taking £1.5m a
+    year in dividends, or a listed-company executive on a £2m package, is a live
+    planning need whether or not they have accumulated investable capital — and
+    they are reachable years before any exit.
+    """
     if investable_mid is not None and investable_mid >= QUALIFYING_THRESHOLD_GBP:
         return "Qualifying"
+    if annual_income is not None and annual_income >= ANNUAL_INCOME_THRESHOLD_GBP:
+        return "High income"
     if gross_mid is not None and gross_mid >= PRIORITY_THRESHOLD_GBP:
         return "Pre-liquidity founder"
-    if investable_mid is None and gross_mid is None:
+    if investable_mid is None and gross_mid is None and annual_income is None:
         return "Research lead"
     return "Below threshold"

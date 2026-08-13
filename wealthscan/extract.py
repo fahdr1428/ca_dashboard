@@ -139,6 +139,10 @@ _TITLE_WORDS = (
     "group chief executive", "executive chairman", "non-executive chairman",
     "billionaire", "millionaire", "tycoon", "magnate", "heiress", "heir",
     "boss", "co-chief executive",
+    # Land and estate wealth. Without these the whole category yields companies
+    # and no people, which is the same as not searching for it.
+    "landowner", "land owner", "estate owner", "farmer", "farm owner",
+    "landlord", "estate manager", "trustee",
 )
 _TITLE_ACRONYMS = ("CEO", "CFO", "MD", "COO", "CTO", "CSO", "CIO", "CCO")
 
@@ -163,6 +167,10 @@ _SUBJECT_VERBS = (
     "has agreed", "have agreed", "completes", "has completed", "confirmed",
     "has confirmed", "will retain", "retains", "has reduced", "reduces",
     "has disposed", "disposes",
+    # Land, estate and succession language.
+    "has restructured", "restructures", "inherits", "has inherited",
+    "has transferred", "transfers", "has put", "puts", "has placed", "places",
+    "received", "has received", "took home", "takes home", "was awarded",
 )
 
 #: Honorifics and name particles, so Gulf, Dutch, German and Iberian names parse.
@@ -441,6 +449,19 @@ _EVENT_SIGNATURES: tuple[tuple[str, re.Pattern[str]], ...] = (
         r"\b(buys?|bought|purchases?|acquires?|snaps? up)\b[^.]{0,50}"
         r"\b(estate|manor|mansion|country house|penthouse|villa|townhouse"
         r"|property portfolio|super-?prime)\b", re.I)),
+    ("land_sale", re.compile(
+        r"\b((?:farm|farmland|land|estate|acres?|holding)s? (?:is |has been |was |have been )?sold"
+        r"|sells? (?:the )?(?:farm|farmland|land|estate)\b|sells? [\d,]+ acres?"
+        r"|sale of the (?:estate|farm|land)|acres? of (?:farmland|land) (?:sold|for sale)"
+        r"|agricultural land sale|acres? (?:go|goes|went) (?:on|under) the hammer)\b", re.I)),
+    ("landholding", re.compile(
+        r"\b(landowner|landed estate|country estate|farming family|family farm"
+        r"|agricultural business|estate owner|tenanted estate"
+        r"|[\d,]+ acres?)\b", re.I)),
+    ("exec_comp", re.compile(
+        r"\b(remuneration report|total remuneration|annual bonus|"
+        r"long-?term incentive|\bLTIP\b|director shareholding|\bPDMR\b"
+        r"|chief executive'?s? pay|pay package|took home)\b", re.I)),
     ("succession", re.compile(
         r"\b(steps? down|stepping down|retires?|retiring|hands over|succession plan"
         r"|passes? the reins|hands? the reins)\b", re.I)),
@@ -479,12 +500,27 @@ class ExtractedEvent:
     rationale: str = ""
 
 
+#: Narrow, high-precision patterns. When one of these fires alongside a generic
+#: one it should win, whatever the weights say: "sold in a management buyout" and
+#: "1,200 acres sold by owner X" both also match the broad "has been sold"
+#: pattern, and reporting them as a plain business exit throws away the thing
+#: that made them worth finding.
+_SPECIFIC_EVENTS = frozenset({
+    "land_sale", "landholding", "exec_comp", "management_buyout", "ipo",
+    "family_office", "rich_list", "large_dividend", "venture_funding",
+    "private_equity",
+})
+
+
 def classify(text: str) -> list[str]:
-    """All event types the text matches, strongest first."""
+    """All event types the text matches, most specific and strongest first."""
     hits = [key for key, pattern in _EVENT_SIGNATURES if pattern.search(text)]
     return sorted(
         hits,
-        key=lambda k: EVENT_BY_KEY[k].weight if k in EVENT_BY_KEY else 0,
+        key=lambda k: (
+            k in _SPECIFIC_EVENTS,
+            EVENT_BY_KEY[k].weight if k in EVENT_BY_KEY else 0,
+        ),
         reverse=True,
     )
 

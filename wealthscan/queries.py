@@ -156,6 +156,40 @@ EVENT_TEMPLATES: tuple[EventTemplate, ...] = (
         "Growth builds value over time. Weak on its own, useful in combination.",
     ),
     EventTemplate(
+        "land_sale",
+        "Land or estate sale",
+        '("farmland sold" OR "farm sold" OR "estate sold" OR "sells farmland" OR '
+        '"sells the estate" OR "land sale" OR "acres sold" OR "agricultural land '
+        'sale" OR "sale of the estate")',
+        85,
+        "Land converts to cash rarely and in large amounts. Agricultural and "
+        "estate wealth is systematically under-covered by prospecting tools "
+        "because it generates no funding rounds and no tech press, which is "
+        "precisely why it is worth searching for deliberately.",
+    ),
+    EventTemplate(
+        "landholding",
+        "Landowner or estate",
+        '("landowner" OR "landed estate" OR "country estate" OR "farming family" OR '
+        '"agricultural business" OR "estate owner" OR "acres of farmland" OR '
+        '"family farm" OR "tenanted estate")',
+        70,
+        "Substantial land indicates substantial wealth, almost all of it "
+        "illiquid. These owners are rarely approached and often face an "
+        "inheritance-tax problem they have not solved.",
+    ),
+    EventTemplate(
+        "exec_comp",
+        "Executive pay or shareholding",
+        '("remuneration report" OR "total remuneration" OR "annual bonus" OR '
+        '"long-term incentive" OR "LTIP" OR "director shareholding" OR '
+        '"PDMR shareholding" OR "chief executive pay")',
+        75,
+        "Listed-company disclosures state executive pay and shareholdings "
+        "exactly, so no assumption is needed. A £1m+ package is a live income "
+        "planning need even where liquid capital is modest.",
+    ),
+    EventTemplate(
         "succession",
         "Succession or retirement",
         '("steps down" OR retires OR "hands over" OR succession) '

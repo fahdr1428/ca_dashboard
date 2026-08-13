@@ -1,10 +1,12 @@
-# Executive palette: dark slate with a single teal accent for money.
+# Brass on ink. Deliberately not the default dashboard teal-on-slate: this is a
+# tool a private-client advisor opens every morning, and it should read closer to
+# a client report than to an analytics console.
 [theme]
 base = "dark"
-primaryColor = "#2dd4bf"
-backgroundColor = "#0e1116"
-secondaryBackgroundColor = "#161a21"
-textColor = "#e8eaed"
+primaryColor = "#b8945f"
+backgroundColor = "#0c0e11"
+secondaryBackgroundColor = "#15181d"
+textColor = "#e9e6e0"
 font = "sans serif"
 
 [server]

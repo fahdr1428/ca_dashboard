@@ -51,6 +51,23 @@ CREATE TABLE IF NOT EXISTS prospects (
     investable_low_gbp   INTEGER,
     investable_mid_gbp   INTEGER,
     investable_high_gbp  INTEGER,
+    -- Recurring income, tracked separately from assets: a £2m salary and £2m in
+    -- the bank are different prospects with different needs.
+    annual_income_gbp    INTEGER,
+    annual_income_basis  TEXT,
+    -- The company behind the person: listed or private, and how big.
+    company_status       TEXT,
+    company_revenue_gbp  INTEGER,
+    company_number       TEXT,
+    -- Only ever populated from public reporting, never inferred.
+    known_adviser        TEXT,
+    latest_newsflow      TEXT,
+    -- How direct the strongest source is: High / Medium / Low. Distinct from the
+    -- numeric confidence, and answers the question an advisor asks first — am I
+    -- reading a filing or a journalist's estimate?
+    evidence_grade       TEXT NOT NULL DEFAULT 'Low',
+    evidence_basis       TEXT,
+    wealth_source        TEXT,
     wealth_band          TEXT NOT NULL DEFAULT 'Not estimated',
     cohort               TEXT NOT NULL DEFAULT 'Research lead',
     estimate_method      TEXT,
@@ -139,6 +156,22 @@ CREATE TABLE IF NOT EXISTS seen_urls (
     first_seen TEXT NOT NULL
 );
 
+-- Refusals, kept rather than discarded. A screening rule you cannot inspect is
+-- indistinguishable from a bug, and "why is nobody from Hampshire showing up"
+-- is only answerable if the rejections are on record.
+CREATE TABLE IF NOT EXISTS exclusions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at  TEXT NOT NULL,
+    rule        TEXT NOT NULL,
+    reason      TEXT NOT NULL,
+    person_name TEXT,
+    company     TEXT,
+    title       TEXT,
+    url         TEXT,
+    publisher   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_exclusions_rule ON exclusions(rule);
+
 CREATE INDEX IF NOT EXISTS idx_prospects_market ON prospects(market_key);
 CREATE INDEX IF NOT EXISTS idx_prospects_country ON prospects(country);
 CREATE INDEX IF NOT EXISTS idx_prospects_investable ON prospects(investable_mid_gbp);
@@ -158,6 +191,16 @@ ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("ch_company_name", "TEXT"),
         ("ch_registered_office", "TEXT"),
         ("ch_profile_url", "TEXT"),
+        ("annual_income_gbp", "INTEGER"),
+        ("annual_income_basis", "TEXT"),
+        ("company_status", "TEXT"),
+        ("company_revenue_gbp", "INTEGER"),
+        ("company_number", "TEXT"),
+        ("known_adviser", "TEXT"),
+        ("latest_newsflow", "TEXT"),
+        ("evidence_grade", "TEXT NOT NULL DEFAULT 'Low'"),
+        ("evidence_basis", "TEXT"),
+        ("wealth_source", "TEXT"),
     ),
     "runs": (
         ("depth", "TEXT"),
@@ -318,7 +361,9 @@ def upsert_prospect(conn: sqlite3.Connection, record: dict[str, Any]) -> tuple[i
         "job_title", "company", "matched_place", "locality", "address",
         "primary_event", "rationale", "ch_company_number", "ch_company_name",
         "ch_officer_name", "ch_ownership_band", "ch_registered_office",
-        "ch_profile_url", "ch_verified_at",
+        "ch_profile_url", "ch_verified_at", "company_status", "company_number",
+        "company_revenue_gbp", "known_adviser", "wealth_source",
+        "annual_income_gbp", "annual_income_basis",
     ):
         if record.get(key) and not existing[key]:
             updates[key] = record[key]
@@ -329,6 +374,21 @@ def upsert_prospect(conn: sqlite3.Connection, record: dict[str, Any]) -> tuple[i
         for key in ("market_key", "market_name", "market_group", "country"):
             if record.get(key):
                 updates[key] = record[key]
+
+    # The newest newsflow always wins — it is a timeline, not an estimate.
+    if record.get("latest_newsflow"):
+        updates["latest_newsflow"] = record["latest_newsflow"]
+
+    # A more direct source upgrades the evidence grade regardless of the score:
+    # a PSC filing arriving after a rich-list mention is strictly better news.
+    if record.get("evidence_grade"):
+        from .evidence import GRADE_ORDER
+
+        current = existing["evidence_grade"] or "Low"
+        incoming = record["evidence_grade"]
+        if GRADE_ORDER.index(incoming) < GRADE_ORDER.index(current):
+            updates["evidence_grade"] = incoming
+            updates["evidence_basis"] = record.get("evidence_basis")
 
     # Better-evidenced estimate wins.
     if record.get("confidence", 0) >= (existing["confidence"] or 0):
@@ -382,6 +442,32 @@ def source_count(conn: sqlite3.Connection, prospect_id: int) -> int:
         "SELECT COUNT(*) AS n FROM sources WHERE prospect_id = ?", (prospect_id,)
     ).fetchone()
     return int(row["n"]) if row else 0
+
+
+def record_exclusion(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:
+    """Log a refused candidate so the screening can be audited."""
+    conn.execute(
+        """INSERT INTO exclusions
+           (created_at, rule, reason, person_name, company, title, url, publisher)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            now_iso(), entry["rule"], entry["reason"], entry.get("person_name"),
+            entry.get("company"), entry.get("title"), entry.get("url"),
+            entry.get("publisher"),
+        ),
+    )
+
+
+def exclusions(conn: sqlite3.Connection, limit: int = 200) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM exclusions ORDER BY created_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+
+
+def exclusion_counts(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT rule, COUNT(*) AS n FROM exclusions GROUP BY rule ORDER BY n DESC"
+    ).fetchall()
 
 
 def mark_seen(conn: sqlite3.Connection, url: str) -> bool:

@@ -232,9 +232,6 @@ _ME: list[Market] = [
     _m("om-oman", "Oman", GROUP_ME, "Oman", "OMR", 23.5880, 58.3829, [
         "Oman", "Muscat", "Salalah",
     ]),
-    _m("il-tel-aviv", "Israel", GROUP_ME, "Israel", "ILS", 32.0853, 34.7818, [
-        "Israel", "Tel Aviv", "Herzliya", "Jerusalem", "Haifa",
-    ]),
     _m("tr-istanbul", "Türkiye", GROUP_ME, "Türkiye", "TRY", 41.0082, 28.9784, [
         "Turkey", "Türkiye", "Istanbul", "Ankara", "Izmir",
     ]),
@@ -346,8 +343,19 @@ MARKET_BY_NAME: dict[str, Market] = {m.name: m for m in ALL_MARKETS}
 
 CORE_MARKET_KEYS: tuple[str, ...] = tuple(m.key for m in ALL_MARKETS if m.core)
 
+#: The advisor's stated target geography: Bristol, Bath, London, Wiltshire,
+#: Hampshire, West Sussex, Oxfordshire, Somerset, Devon, Cornwall, Dorset,
+#: Gloucestershire. Bath sits inside the Somerset market, so twelve named areas
+#: resolve to eleven markets.
+TARGET_PROFILE_KEYS: tuple[str, ...] = (
+    "uk-bristol", "uk-somerset", "uk-london", "uk-wiltshire", "uk-hampshire",
+    "uk-west-sussex", "uk-oxfordshire", "uk-devon", "uk-cornwall", "uk-dorset",
+    "uk-gloucestershire",
+)
+
 #: Preset selections offered in the UI, so nobody has to tick sixty boxes.
 PRESETS: dict[str, tuple[str, ...]] = {
+    "Target profile (Bristol, Bath, London & the South West)": TARGET_PROFILE_KEYS,
     "Core patch (13 southern English counties)": CORE_MARKET_KEYS,
     "All United Kingdom": tuple(m.key for m in ALL_MARKETS if m.group == GROUP_UK),
     "UK + United States": tuple(
@@ -359,7 +367,7 @@ PRESETS: dict[str, tuple[str, ...]] = {
     "Everywhere": tuple(m.key for m in ALL_MARKETS),
 }
 
-DEFAULT_PRESET = "UK + US + Middle East"
+DEFAULT_PRESET = "Target profile (Bristol, Bath, London & the South West)"
 
 
 def markets_in_group(group: str) -> list[Market]:
@@ -388,7 +396,6 @@ _LOCALE: dict[str, tuple[str, str]] = {
     "Kuwait": ("en-KW", "KW"),
     "Bahrain": ("en-BH", "BH"),
     "Oman": ("en-OM", "OM"),
-    "Israel": ("en-IL", "IL"),
     "Türkiye": ("en-TR", "TR"),
     "Egypt": ("en-EG", "EG"),
     "Jordan": ("en-JO", "JO"),

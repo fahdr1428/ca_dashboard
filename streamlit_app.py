@@ -32,6 +32,8 @@ from wealthscan.config import (
     PRIORITY_THRESHOLD_GBP,
     QUALIFYING_THRESHOLD_GBP,
 )
+from wealthscan.evidence import GRADE_ORDER, TIERS
+from wealthscan.exclusions import BANNED_SOURCE_DOMAINS, MEGA_WEALTH_CEILING_GBP
 from wealthscan.markets import (
     ALL_MARKETS,
     DEFAULT_PRESET,
@@ -61,7 +63,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-ACCENT = "#0f766e"
+# Brass on ink rather than the usual dashboard teal-on-slate. A tool an advisor
+# opens every morning should look like the rest of their working life —
+# closer to a private-client report than to an analytics console.
+ACCENT = "#b8945f"
+ACCENT_SOFT = "rgba(184,148,95,.18)"
 BAND_ORDER = [
     "Not estimated", "Below £7.5m", "£7.5m – £15m", "£15m – £30m",
     "£30m – £50m", "£50m – £100m", "£100m+",
@@ -69,19 +75,49 @@ BAND_ORDER = [
 
 CSS = """
 <style>
-  .block-container { padding-top: 1.6rem; max-width: 1600px; }
-  [data-testid="stMetricValue"] { font-size: 1.6rem; font-variant-numeric: tabular-nums; }
-  [data-testid="stMetricLabel"] { font-size: .72rem; text-transform: uppercase;
-                                  letter-spacing: .05em; opacity: .7; }
-  .reason { font-size: .82rem; opacity: .8; line-height: 1.6; margin: .15rem 0 .5rem; }
-  .pill { display:inline-block; padding:.12rem .5rem; border-radius:.4rem; font-size:.7rem;
-          font-weight:600; border:1px solid rgba(128,128,128,.35); margin-right:.3rem; }
-  .pill-good { background:rgba(15,118,110,.18); border-color:rgba(15,118,110,.55); }
-  .pill-warn { background:rgba(180,83,9,.18);  border-color:rgba(180,83,9,.55); }
-  .pill-none { background:transparent; opacity:.7; }
-  .step { font-size:.72rem; text-transform:uppercase; letter-spacing:.08em;
-          opacity:.65; font-weight:700; margin-bottom:.2rem; }
-  table { font-variant-numeric: tabular-nums; }
+  :root {
+    --brass: #b8945f;
+    --brass-soft: rgba(184,148,95,.16);
+    --rule: rgba(184,148,95,.28);
+  }
+  .block-container { padding-top: 1.2rem; max-width: 1680px; }
+
+  /* Editorial headings, tabular data. The mix is the identity: a serif
+     masthead over numbers that line up in columns. */
+  h1, h2, h3, .masthead-name {
+    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+    letter-spacing: -.01em;
+  }
+  h1 { font-weight: 600; }
+  h1::after {
+    content: ""; display: block; width: 3.2rem; height: 2px;
+    background: var(--brass); margin-top: .55rem; opacity: .85;
+  }
+
+  [data-testid="stMetricValue"] {
+    font-size: 1.55rem; font-variant-numeric: tabular-nums; letter-spacing: -.01em;
+  }
+  [data-testid="stMetricLabel"] {
+    font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; opacity: .68;
+  }
+
+  .masthead { display:flex; align-items:baseline; gap:.5rem; margin-bottom:.1rem; }
+  .masthead-mark { color: var(--brass); font-size: 1.05rem; }
+  .masthead-name { font-size: 1.12rem; font-weight: 600; }
+  .masthead-rule { height:1px; background:var(--rule); margin:.6rem 0 .5rem; }
+
+  .reason { font-size: .82rem; opacity: .82; line-height: 1.6; margin: .15rem 0 .5rem; }
+  .pill { display:inline-block; padding:.14rem .55rem; border-radius:2px; font-size:.68rem;
+          font-weight:600; letter-spacing:.02em; text-transform:uppercase;
+          border:1px solid rgba(140,140,140,.32); margin-right:.35rem; }
+  .pill-good { background:var(--brass-soft); border-color:var(--rule); color:var(--brass); }
+  .pill-warn { background:rgba(180,83,9,.16);  border-color:rgba(180,83,9,.5); }
+  .pill-none { background:transparent; opacity:.72; }
+  .step { font-size:.68rem; text-transform:uppercase; letter-spacing:.1em;
+          color:var(--brass); font-weight:700; margin-bottom:.25rem; }
+
+  table, [data-testid="stDataFrame"] { font-variant-numeric: tabular-nums; }
+  [data-testid="stSidebar"] { border-right: 1px solid var(--rule); }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
@@ -492,7 +528,9 @@ def _run_history() -> None:
 
 
 SORTS = {
-    "Estimated investable assets (highest first)": ("investable_mid_gbp", False),
+    "Estimated net worth (highest first)": ("investable_mid_gbp", False),
+    "Estimated annual income (highest first)": ("annual_income_gbp", False),
+    "Company revenue (highest first)": ("company_revenue_gbp", False),
     "Confidence (highest first)": ("confidence", False),
     "Most recently found": ("first_seen", False),
     "Name (A–Z)": ("full_name", True),
@@ -515,7 +553,7 @@ def _filters(frame: pd.DataFrame) -> pd.DataFrame:
         )
         sort_label = top[3].selectbox("Sort by", list(SORTS))
 
-        mid = st.columns([1.5, 1.4, 1.3, 1.3])
+        mid = st.columns([1.4, 1.3, 1.2, 1.2, 1.3])
         markets = mid[0].multiselect(
             "Market", sorted(frame["market_name"].dropna().unique()), placeholder="Any market",
         )
@@ -523,10 +561,27 @@ def _filters(frame: pd.DataFrame) -> pd.DataFrame:
             "Wealth band", [b for b in BAND_ORDER if b in set(frame["wealth_band"])],
             placeholder="Any wealth band",
         )
-        cohorts = mid[2].multiselect(
+        statuses = mid[2].multiselect(
+            "Company", [s for s in ("Public", "Private")
+                        if s in set(frame["company_status"].dropna())],
+            placeholder="Public or private",
+        )
+        grades = mid[3].multiselect(
+            "Evidence", [g for g in GRADE_ORDER if g in set(frame["evidence_grade"].dropna())],
+            placeholder="Any evidence grade",
+            help="How direct the strongest source is: a filing, the press, or a rich list.",
+        )
+        cohorts = mid[4].multiselect(
             "Cohort", sorted(frame["cohort"].dropna().unique()), placeholder="Any cohort",
         )
-        found_via = mid[3].multiselect(
+
+        wealth_sources = st.multiselect(
+            "Where the wealth comes from",
+            sorted(frame["wealth_source"].dropna().unique()),
+            placeholder="Any source — private ownership, listed pay, land and estates, "
+                        "liquidity events",
+        )
+        found_via = st.multiselect(
             "Found via", sorted(frame["primary_event"].dropna().unique()),
             placeholder="Any wealth event",
         )
@@ -567,8 +622,14 @@ def _filters(frame: pd.DataFrame) -> pd.DataFrame:
         view = view[view["market_name"].isin(markets)]
     if bands:
         view = view[view["wealth_band"].isin(bands)]
+    if statuses:
+        view = view[view["company_status"].isin(statuses)]
+    if grades:
+        view = view[view["evidence_grade"].isin(grades)]
     if cohorts:
         view = view[view["cohort"].isin(cohorts)]
+    if wealth_sources:
+        view = view[view["wealth_source"].isin(wealth_sources)]
     if found_via:
         view = view[view["primary_event"].isin(found_via)]
     view = view[view["confidence"] >= min_confidence]
@@ -601,21 +662,28 @@ def page_list(frame: pd.DataFrame) -> None:
         rows = sources.get(int(prospect_id), [])
         return str(rows[0].get(field) or "") if rows else ""
 
-    # Deliberately few columns. Country is already inside "Where", and the date
-    # found, the citation count and the full history live on the record — a table
-    # you have to scroll sideways to read is not an easier table.
+    # Every monetary column is named "Est." because a bare number in a table
+    # reads as a fact no matter what the footnote says.
     table = pd.DataFrame({
         "Name": view["full_name"],
         "Role": view["job_title"].fillna(""),
-        "Company": view["company"].fillna(""),
+        "Company / vehicle": view["company"].fillna(""),
+        "Co. type": view["company_status"].fillna("—"),
         "Where": view.apply(where_text, axis=1),
-        "Est. investable £": view["investable_mid_gbp"],
+        # Coerced to numeric so an all-empty column renders blank rather than a
+        # column of the word "None" — which reads as a stated fact about someone's
+        # revenue, and is the same class of error as showing £0.
+        "Est. net worth £": pd.to_numeric(view["investable_mid_gbp"], errors="coerce"),
+        "Co. revenue £": pd.to_numeric(view["company_revenue_gbp"], errors="coerce"),
+        "Est. income £": pd.to_numeric(view["annual_income_gbp"], errors="coerce"),
         "Band": view["wealth_band"],
+        "Evidence": view["evidence_grade"].fillna("Low"),
         "Confidence": view["confidence"],
-        "Found via": view["primary_event"].fillna(""),
-        "Verified": view["ch_officer_name"].notna(),
-        "Located": view["market_source"] == "text",
-        "Status": view["status"],
+        "Wealth source": view["wealth_source"].fillna("—"),
+        "Adviser": view["known_adviser"].fillna(""),
+        "Latest newsflow": view["latest_newsflow"].fillna(""),
+        "CH": view["ch_officer_name"].notna(),
+        "Pipeline": view["status"],
         "Source": view["id"].map(lambda i: first_source(i, "url")),
     }).reset_index(drop=True)
 
@@ -629,38 +697,72 @@ def page_list(frame: pd.DataFrame) -> None:
         column_config={
             "Name": st.column_config.TextColumn(pinned=True, width="medium"),
             "Role": st.column_config.TextColumn(width="small"),
+            "Company / vehicle": st.column_config.TextColumn(width="medium"),
+            "Co. type": st.column_config.TextColumn(
+                "Co. type", width="small",
+                help="Public (traded shares) or private (Companies House only).",
+            ),
             "Where": st.column_config.TextColumn(width="medium"),
-            "Est. investable £": st.column_config.NumberColumn(
-                "Est. investable £",
-                format="compact",
-                help="Modelled estimate of investable assets, in GBP. Blank means the app "
-                     "declined to put a figure on the evidence — never that it is zero.",
+            "Est. net worth £": st.column_config.NumberColumn(
+                "Est. net worth £", format="compact",
+                help="ESTIMATE of investable assets, in GBP, modelled from public "
+                     "reporting — not a verified figure. Blank means the app declined "
+                     "to put a number on the evidence; it never means zero.",
+            ),
+            "Co. revenue £": st.column_config.NumberColumn(
+                "Co. revenue £", format="compact",
+                help="Filed or reported company turnover. Blank means not publicly "
+                     "disclosed.",
+            ),
+            "Est. income £": st.column_config.NumberColumn(
+                "Est. income £", format="compact",
+                help="Annual remuneration or attributable dividend. Disclosed exactly "
+                     "for listed-company pay; modelled from an assumed stake for "
+                     "dividends. Blank means not publicly disclosed.",
             ),
             "Band": st.column_config.TextColumn(width="small"),
+            "Evidence": st.column_config.TextColumn(
+                "Evidence", width="small",
+                help="How direct the strongest source is. High = a statutory filing "
+                     "(PSC register, accounts, annual report, Land Registry). "
+                     "Medium = trade or business press. Low = a rich-list mention with "
+                     "no breakdown.",
+            ),
             "Confidence": st.column_config.ProgressColumn(
                 "Confidence", min_value=0, max_value=100, format="%d", width="small",
-                help="How well evidenced the record is — a separate question from how "
-                     "wealthy the person is.",
+                help="How well evidenced the record is overall, across six dimensions — "
+                     "a separate question from how wealthy the person is.",
             ),
-            "Verified": st.column_config.CheckboxColumn(
+            "Wealth source": st.column_config.TextColumn(width="medium"),
+            "Adviser": st.column_config.TextColumn(
+                "Adviser", width="small",
+                help="Only ever populated where an adviser relationship is publicly "
+                     "reported. Blank means unknown, not unadvised.",
+            ),
+            "Latest newsflow": st.column_config.TextColumn(width="large"),
+            "CH": st.column_config.CheckboxColumn(
                 "CH ✓", help="Matched to a filed Companies House officer or PSC record.",
             ),
-            "Located": st.column_config.CheckboxColumn(
-                "Located",
-                help="Ticked when the article named the place. Unticked means the market "
-                     "was inferred from the search that found it.",
-            ),
-            "Status": st.column_config.TextColumn(width="small"),
+            "Pipeline": st.column_config.TextColumn(width="small"),
             "Source": st.column_config.LinkColumn(
-                "Article", display_text="open", width="small",
-                help="The first source on the record.",
+                "Source", display_text="open", width="small",
+                help="The first citation on the record. The full list is on the record "
+                     "itself.",
             ),
         },
     )
     st.caption(
         "Click the box at the start of a row to open that person's full record below — "
-        "the figure, how it was reached, every source, and what to do next. Click any "
-        "column heading to sort by it."
+        "every figure, how it was reached, every source, and what to do next. Click any "
+        "column heading to sort by it. Columns continue to the right."
+    )
+    # Streamlit prints a greyed "None" for an empty numeric cell. In a table of
+    # wealth figures that is one glance away from being read as data, so it gets
+    # spelled out rather than left to the reader.
+    st.caption(
+        "**“None” in a money column means not publicly disclosed — it never means zero, "
+        "and it never means the person has nothing.** Every figure shown is a modelled "
+        "estimate unless the record says it was disclosed."
     )
 
     estimate_disclaimer()
@@ -697,23 +799,30 @@ def render_prospect_detail(row: pd.Series) -> None:
     if present(row, "company"):
         heading += f" · {row['company']}"
     st.subheader(heading)
+    grade = str(row["evidence_grade"]) if present(row, "evidence_grade") else "Low"
+    grade_css = {"High": "pill-good", "Medium": "pill-warn"}.get(grade, "pill-none")
     st.markdown(
-        confidence_pill(int(row["confidence"]), str(row["confidence_band"]))
+        f'<span class="pill {grade_css}">Evidence: {grade}</span>'
+        + confidence_pill(int(row["confidence"]), str(row["confidence_band"]))
         + f'<span class="pill pill-none">{row["cohort"]}</span>'
         + f'<span class="pill pill-none">{row["wealth_band"]}</span>'
+        + (f'<span class="pill pill-none">{row["company_status"]} company</span>'
+           if present(row, "company_status") else "")
         + (f'<span class="pill pill-good">Companies House ✓</span>'
            if present(row, "ch_officer_name") else ""),
         unsafe_allow_html=True,
     )
+    if present(row, "evidence_basis"):
+        st.caption(row["evidence_basis"])
 
     left, right = st.columns([1.5, 1])
 
     with left:
         if present(row, "investable_mid_gbp"):
             st.metric(
-                "Estimated investable assets",
+                "Est. net worth (investable)",
                 fmt_gbp(row["investable_mid_gbp"]),
-                help="Modelled from reported figures. Not a verified amount.",
+                help="ESTIMATE, modelled from reported figures. Not a verified amount.",
             )
             st.caption(
                 f"Range {fmt_gbp(row['investable_low_gbp'])} – "
@@ -732,6 +841,42 @@ def render_prospect_detail(row: pd.Series) -> None:
                 + (str(row["not_estimated_reason"]) if present(row, "not_estimated_reason")
                    else "No basis for an estimate was found.")
                 + "</div>",
+                unsafe_allow_html=True,
+            )
+
+        # The brief's other three money columns, each allowed to say "not
+        # publicly disclosed" rather than showing a modelled stand-in.
+        facts = st.columns(3)
+        facts[0].metric(
+            "Est. annual comp / dividend",
+            fmt_gbp(row["annual_income_gbp"]) if present(row, "annual_income_gbp")
+            else "not disclosed",
+        )
+        facts[1].metric(
+            "Company revenue",
+            fmt_gbp(row["company_revenue_gbp"]) if present(row, "company_revenue_gbp")
+            else "not disclosed",
+        )
+        facts[2].metric(
+            "Wealth source",
+            str(row["wealth_source"]) if present(row, "wealth_source") else "—",
+        )
+        if present(row, "annual_income_basis"):
+            st.markdown(
+                f'<div class="reason"><strong>Income basis:</strong> '
+                f'{row["annual_income_basis"]}</div>',
+                unsafe_allow_html=True,
+            )
+        if present(row, "known_adviser"):
+            st.markdown(
+                f'<div class="reason"><strong>Known adviser:</strong> '
+                f'{row["known_adviser"]} — as publicly reported.</div>',
+                unsafe_allow_html=True,
+            )
+        if present(row, "latest_newsflow"):
+            st.markdown(
+                f'<div class="reason"><strong>Latest newsflow:</strong> '
+                f'{row["latest_newsflow"]}</div>',
                 unsafe_allow_html=True,
             )
 
@@ -1062,6 +1207,80 @@ def page_overview(frame: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 
 
+def page_screened_out() -> None:
+    st.title("Screened out")
+    st.caption(
+        "Candidates the app refused, and why. Kept on record rather than silently "
+        "dropped — “why is nobody from Hampshire showing up” is only answerable if "
+        "the rejections are visible."
+    )
+
+    with db.connect() as conn:
+        counts = [dict(r) for r in db.exclusion_counts(conn)]
+        rows = [dict(r) for r in db.exclusions(conn, limit=500)]
+
+    rules = {
+        "celebrity": (
+            "Sport, entertainment and broadcasting",
+            "Not a realistic introduction. Already served through networks the firm "
+            "does not sit in, a public profile that makes cold outreach unworkable, "
+            "and reported figures that are usually aggregator guesswork.",
+        ),
+        "mega-wealth": (
+            f"Above the £{MEGA_WEALTH_CEILING_GBP / 1_000_000:.0f}m ceiling",
+            "National rich-list names are not addressable by a regional private-client "
+            "firm. The target is owner-managers and family businesses who are not "
+            "household names.",
+        ),
+        "banned-source": (
+            "Disqualifying source",
+            "“Estimated net worth” aggregators publish numbers with no method, no "
+            "filing behind them and no correction process. Refused on the domain "
+            "rather than the content, for anyone.",
+        ),
+    }
+
+    if counts:
+        columns = st.columns(len(rules))
+        by_rule = {c["rule"]: c["n"] for c in counts}
+        for index, (key, (label, why)) in enumerate(rules.items()):
+            columns[index].metric(label, by_rule.get(key, 0), help=why)
+    else:
+        st.info(
+            "Nothing has been screened out yet. The rules are live — they simply have "
+            "not had to fire."
+        )
+
+    with st.expander("The rules, in full"):
+        for key, (label, why) in rules.items():
+            st.markdown(f"**{label}** — {why}")
+        st.markdown("**Refused source domains**")
+        st.code("\n".join(sorted(BANNED_SOURCE_DOMAINS)), language="text")
+
+    if rows:
+        st.divider()
+        st.subheader(f"{len(rows)} refused candidate(s)")
+        st.dataframe(
+            pd.DataFrame([{
+                "When": r["created_at"][:10],
+                "Rule": r["rule"],
+                "Name": r["person_name"] or "—",
+                "Company": r["company"] or "—",
+                "Headline": r["title"],
+                "Publisher": r["publisher"] or "—",
+                "Why": r["reason"],
+                "Source": r["url"] or "",
+            } for r in rows]),
+            hide_index=True, width="stretch",
+            height=min(420, 60 + 36 * len(rows)),
+            column_config={
+                "Why": st.column_config.TextColumn(width="large"),
+                "Headline": st.column_config.TextColumn(width="large"),
+                "Source": st.column_config.LinkColumn("Source", display_text="open"),
+            },
+        )
+
+
 def page_research_doc() -> None:
     st.title("Weekly research document")
     st.caption(
@@ -1183,6 +1402,40 @@ def page_methodology() -> None:
             for t in EVENT_TEMPLATES
         ]),
         hide_index=True, width="stretch",
+    )
+
+    st.subheader("Evidence grades")
+    st.markdown(
+        "Separate from the confidence score, and answering a blunter question: "
+        "**am I reading a filing, or a journalist's estimate?** A record inherits "
+        "the grade of its strongest source."
+    )
+    st.dataframe(
+        pd.DataFrame([
+            {"Grade": t.grade, "Source": t.label, "What it establishes": t.meaning}
+            for t in TIERS
+        ]),
+        hide_index=True, width="stretch",
+    )
+
+    st.subheader("Who is deliberately excluded")
+    st.markdown(
+        f"""
+A prospect list is judged as much by what it keeps out. Three kinds of record are
+refused before they can be created, each logged on the **Screened out** page:
+
+- **Sport, entertainment and broadcasting.** Not realistic introductions: already
+  served through networks the firm does not sit in, and a public profile makes
+  cold outreach unworkable. The reported figures are usually guesswork anyway.
+- **Above £{MEGA_WEALTH_CEILING_GBP / 1_000_000:.0f}m gross.** National rich-list
+  names are not addressable by a regional private-client firm. The target is
+  owner-managers, second-generation family businesses, mid-market exits and
+  landowners who are not household names.
+- **"Estimated net worth" aggregators.** {len(BANNED_SOURCE_DOMAINS)} domains are
+  refused outright, on the domain rather than the content — they publish numbers
+  with no method, no filing behind them and no correction process. Not weak
+  evidence: not evidence.
+        """
     )
 
     st.subheader("The assumption that matters most")
@@ -1318,12 +1571,18 @@ PAGES = {
     "Overview": lambda: page_overview(frame),
     "Prospect list": lambda: page_list(frame),
     "Find prospects": lambda: page_find(frame),
+    "Screened out": page_screened_out,
     "Weekly research document": page_research_doc,
     "How it works": page_methodology,
 }
 
 with st.sidebar:
-    st.markdown(f"### ◈ {APP_NAME}")
+    st.markdown(
+        f'<div class="masthead"><span class="masthead-mark">◈</span>'
+        f'<span class="masthead-name">{APP_NAME}</span></div>'
+        f'<div class="masthead-rule"></div>',
+        unsafe_allow_html=True,
+    )
     st.caption(APP_SUBTITLE)
 
     # A fresh install has nothing to look at, so it opens on the page that fixes

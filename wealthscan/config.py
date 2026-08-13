@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 APP_NAME = "Lead Intelligence"
-APP_SUBTITLE = "Private wealth prospecting · UK · US · Middle East"
+APP_SUBTITLE = "Private client prospecting · South West · London · 69 markets"
 MODEL_VERSION = "3.0.0"
 
 # --- Storage ---------------------------------------------------------------
@@ -21,8 +21,12 @@ MODEL_VERSION = "3.0.0"
 DB_PATH = Path(os.environ.get("WEALTHSCAN_DB", Path(__file__).resolve().parent.parent / "wealthscan.db"))
 
 # --- Qualifying thresholds -------------------------------------------------
+# Two independent routes to qualifying, because they find different people. A
+# founder who sold up has assets; a listed-company executive or a dividend-taking
+# owner-manager has income and may hold very little liquid capital yet.
 QUALIFYING_THRESHOLD_GBP = 7_500_000
 PRIORITY_THRESHOLD_GBP = 15_000_000
+ANNUAL_INCOME_THRESHOLD_GBP = 1_000_000
 
 # --- Networking ------------------------------------------------------------
 # Identify honestly so publishers can block us if they wish, and stay slow

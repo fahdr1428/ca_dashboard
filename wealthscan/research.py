@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from typing import Callable
 
 from . import db
+from .evidence import classify_source, grade_record
+from .exclusions import screen
 from .extract import ExtractedEvent, extract_event
 from .markets import MARKET_BY_KEY, expand_selection
 from .queries import (
@@ -50,6 +52,7 @@ class RunResult:
     updated_prospects: int = 0
     company_leads: int = 0
     rejected: int = 0
+    excluded: int = 0
     warnings: list[str] = field(default_factory=list)
     log: list[str] = field(default_factory=list)
     duration_seconds: float = 0.0
@@ -162,6 +165,28 @@ def run_research(
                 result.rejected += 1
                 continue
 
+            # Screen before a record can exist. A prospect that is created and
+            # then hidden still turns up in exports, totals and screenshots.
+            refusal = screen(
+                text=f"{event.title} {event.summary}",
+                person_name=event.people[0].name if event.people else None,
+                job_title=event.people[0].title if event.people else None,
+                url=event.url,
+            )
+            if refusal is not None:
+                result.excluded += 1
+                with db.connect() as conn:
+                    db.record_exclusion(conn, {
+                        "rule": refusal.rule,
+                        "reason": refusal.reason,
+                        "person_name": event.people[0].name if event.people else None,
+                        "company": event.company,
+                        "title": event.title,
+                        "url": event.url,
+                        "publisher": event.publisher,
+                    })
+                continue
+
             result.events_kept += 1
             outcome = _store_event(
                 event,
@@ -211,6 +236,48 @@ def run_research(
     return result
 
 
+#: Which of the brief's four wealth sources an event evidences. Land and estate
+#: wealth is called out separately because it is the one a news-driven tool would
+#: otherwise never surface — it generates no funding rounds and no tech press.
+WEALTH_SOURCE: dict[str, str] = {
+    "business_exit": "Liquidity event",
+    "acquisition": "Liquidity event",
+    "management_buyout": "Liquidity event",
+    "windfall": "Liquidity event",
+    "share_sale": "Liquidity event",
+    "ipo": "Liquidity event",
+    "private_equity": "Liquidity event",
+    "venture_funding": "Private company ownership",
+    "large_dividend": "Private company ownership",
+    "company_growth": "Private company ownership",
+    "family_office": "Private company ownership",
+    "succession": "Succession or inheritance",
+    "exec_comp": "Listed-company pay or shareholding",
+    "land_sale": "Land, estate or farming",
+    "landholding": "Land, estate or farming",
+    "property": "Property",
+    "rich_list": "Rich-list inclusion",
+}
+
+#: Suffixes that mark a listed company. Anything else filed at Companies House is
+#: treated as private, which is right far more often than not.
+_LISTED_MARKERS = ("plc", "p.l.c", "public limited", "pjsc", " inc", " corp")
+
+
+def _company_status(event: ExtractedEvent, ch_match) -> str | None:
+    """Public or private, from the company's own name where it can be told."""
+    name = (ch_match.company_name if ch_match else event.company) or ""
+    if not name:
+        return None
+    lowered = name.lower()
+    if any(marker in lowered for marker in _LISTED_MARKERS):
+        return "Public"
+    if event.event_key in ("ipo", "exec_comp", "share_sale"):
+        # These events only happen to companies with traded shares.
+        return "Public"
+    return "Private"
+
+
 def _store_event(
     event: ExtractedEvent, *, fetcher: Fetcher, verify_ch: bool
 ) -> dict[str, object]:
@@ -234,6 +301,19 @@ def _store_event(
         )
 
     stake_verified = bool(ch_match and ch_match.ownership_band)
+
+    # Grading happens on the citation, and a Companies House confirmation is a
+    # filing rather than a news report — so a verified record is graded High even
+    # though it was discovered from press.
+    tier = classify_source(url=event.url, publisher=event.publisher, title=event.title)
+    if ch_match and ch_match.matched_via:
+        evidence_grade, evidence_basis = grade_record([{
+            "url": ch_match.profile_url,
+            "publisher": "Companies House",
+            "title": f"{ch_match.company_name} filings",
+        }])
+    else:
+        evidence_grade, evidence_basis = tier.grade, tier.meaning
 
     estimate = estimate_from_event(
         event_key=event.event_key,
@@ -284,7 +364,20 @@ def _store_event(
             "investable_mid_gbp": estimate.investable_mid_gbp,
             "investable_high_gbp": estimate.investable_high_gbp,
             "wealth_band": estimate.band,
-            "cohort": cohort_for(estimate.investable_mid_gbp, estimate.gross_mid_gbp),
+            "cohort": cohort_for(
+                estimate.investable_mid_gbp, estimate.gross_mid_gbp,
+                estimate.annual_income_gbp,
+            ),
+            "annual_income_gbp": estimate.annual_income_gbp,
+            "annual_income_basis": estimate.annual_income_basis,
+            "company_status": _company_status(event, ch_match),
+            "company_number": ch_match.company_number if ch_match else None,
+            "known_adviser": None,  # only ever set from explicit public reporting
+            "latest_newsflow": f"{event.published_at:%d %b %Y} · {event.title}"
+                               if event.published_at else event.title,
+            "evidence_grade": evidence_grade,
+            "evidence_basis": evidence_basis,
+            "wealth_source": WEALTH_SOURCE.get(event.event_key, "Other"),
             "estimate_method": estimate.method,
             "estimate_caveats": json.dumps(estimate.caveats),
             "not_estimated_reason": estimate.not_estimated_reason,

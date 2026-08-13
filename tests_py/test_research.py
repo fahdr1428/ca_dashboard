@@ -538,6 +538,149 @@ class TestOwnershipBands(unittest.TestCase):
         self.assertGreater(filed.gross_mid_gbp, assumed.gross_mid_gbp)
 
 
+class TestScreening(unittest.TestCase):
+    """What the book refuses to contain.
+
+    These matter as much as the extraction tests. A prospecting list is judged by
+    what it keeps out: every celebrity, every billionaire and every aggregator
+    guess in it costs the advisor the time it takes to work out why it is useless.
+    """
+
+    def test_sport_and_entertainment_are_excluded(self):
+        from wealthscan.exclusions import screen
+        for text in [
+            "Former Premier League footballer sells his Surrey property empire for £40m",
+            "The actor, who starred in three Bond films, has sold his Dorset estate",
+            "Chart-topping singer buys Cotswolds manor after album sales surge",
+            "BBC presenter and broadcaster sells production company for £12m",
+        ]:
+            refusal = screen(text=text)
+            self.assertIsNotNone(refusal, text)
+            self.assertEqual(refusal.rule, "celebrity", text)
+
+    def test_a_genuine_business_owner_is_not_excluded(self):
+        """The screen must not eat the actual target. A manufacturer who sponsors
+        a football club is still a manufacturer."""
+        from wealthscan.exclusions import screen
+        for text in [
+            "Exeter engineering group acquired for £64m; chairman Gareth Halberton sold up",
+            "Wiltshire estate sells 1,200 acres of farmland for £14.8m",
+            "Bristol plc chief executive's total remuneration reaches £2.4m",
+            "Cheltenham software founder sells her stake in an £88m secondary",
+        ]:
+            self.assertIsNone(screen(text=text), text)
+
+    def test_aggregator_sources_are_refused_on_the_domain(self):
+        """Refused for the source, not the content — an aggregator page can look
+        like perfectly good evidence, which is exactly the problem."""
+        from wealthscan.exclusions import screen
+        refusal = screen(
+            text="Gloucestershire haulage boss sold his stake in the Cheltenham firm",
+            url="https://www.celebritynetworth.com/richest/desmond-wraycott/",
+        )
+        self.assertIsNotNone(refusal)
+        self.assertEqual(refusal.rule, "banned-source")
+        # Subdomains count as the same publisher.
+        self.assertIsNotNone(screen(text="x", url="https://uk.celebritynetworth.com/a"))
+        # A legitimate publisher on the same subject is untouched.
+        self.assertIsNone(screen(
+            text="Gloucestershire haulage boss sold his stake",
+            url="https://www.insidermedia.com/news/south-west/haulage-sale",
+        ))
+
+    def test_mega_wealth_is_out_of_scope_at_the_top(self):
+        from wealthscan.exclusions import screen, MEGA_WEALTH_CEILING_GBP
+        refusal = screen(text="Industrialist sells up", gross_wealth_gbp=19_000_000_000)
+        self.assertIsNotNone(refusal)
+        self.assertEqual(refusal.rule, "mega-wealth")
+        # The target band is untouched.
+        self.assertIsNone(screen(text="Owner sells up", gross_wealth_gbp=12_000_000))
+        self.assertIsNone(screen(
+            text="Owner sells up", gross_wealth_gbp=MEGA_WEALTH_CEILING_GBP))
+
+    def test_every_refusal_carries_a_reason(self):
+        from wealthscan.exclusions import screen
+        refusal = screen(text="Premier League footballer sells his business")
+        self.assertTrue(len(refusal.reason) > 40, "a rule you cannot read is a bug")
+
+
+class TestEvidenceGrading(unittest.TestCase):
+    """Confidence tied to how *direct* the source is, per the research brief."""
+
+    def test_grades_follow_source_directness(self):
+        from wealthscan.evidence import classify_source
+        cases = [
+            ("https://find-and-update.company-information.service.gov.uk/company/07890123",
+             "Companies House", "High"),
+            ("https://www.londonstockexchange.com/news-article/RNS", "RNS", "High"),
+            ("https://www.gov.uk/search-property-information-land-registry",
+             "Land Registry", "High"),
+            ("https://www.insidermedia.com/news/south-west/deal", "Insider Media", "Medium"),
+            ("https://example.invalid/rich-list-2026", "Sunday Times Rich List", "Low"),
+        ]
+        for url, publisher, expected in cases:
+            tier = classify_source(url=url, publisher=publisher)
+            self.assertEqual(tier.grade, expected, f"{publisher} → {tier.label}")
+
+    def test_the_strongest_source_sets_the_grade(self):
+        """One filing beats any amount of commentary."""
+        from wealthscan.evidence import grade_record
+        grade, why = grade_record([
+            {"url": "https://example.invalid/x", "publisher": "Sunday Times Rich List",
+             "title": "Rich list 2026"},
+            {"url": "https://find-and-update.company-information.service.gov.uk/company/1",
+             "publisher": "Companies House", "title": "PSC register"},
+        ])
+        self.assertEqual(grade, "High")
+        self.assertIn("companies house", why.lower())
+
+    def test_no_sources_is_low_not_high(self):
+        from wealthscan.evidence import grade_record
+        self.assertEqual(grade_record([])[0], "Low")
+
+
+class TestIncomeRoute(unittest.TestCase):
+    """£1m+/year qualifies independently of assets — a different person, found a
+    different way, and reachable years before any exit."""
+
+    def test_disclosed_executive_pay_is_income_not_net_worth(self):
+        estimate = estimate_from_event(
+            event_key="exec_comp", amount_gbp=2_400_000,
+            text="total remuneration of £2.4m", has_named_person=True,
+        )
+        self.assertEqual(estimate.annual_income_gbp, 2_400_000)
+        self.assertIsNone(estimate.investable_mid_gbp,
+                          "pay does not evidence accumulated capital")
+        self.assertIn("Stated, not modelled", estimate.annual_income_basis)
+
+    def test_dividend_produces_an_attributable_income(self):
+        estimate = estimate_from_event(
+            event_key="large_dividend", amount_gbp=4_050_000,
+            text="record dividend", has_named_person=True,
+        )
+        self.assertIsNotNone(estimate.annual_income_gbp)
+        self.assertLess(estimate.annual_income_gbp, 4_050_000, "only their share")
+        self.assertIn("assumed", estimate.annual_income_basis)
+
+    def test_income_qualifies_without_assets(self):
+        self.assertEqual(cohort_for(None, None, 2_400_000), "High income")
+        self.assertEqual(cohort_for(None, None, 400_000), "Below threshold")
+        # Assets still win where both apply.
+        self.assertEqual(cohort_for(20_000_000, 40_000_000, 2_400_000), "Qualifying")
+
+    def test_land_events_are_split_by_whether_money_moved(self):
+        sale = estimate_from_event(
+            event_key="land_sale", amount_gbp=14_800_000,
+            text="1,200 acres sold", has_named_person=True)
+        holding = estimate_from_event(
+            event_key="landholding", amount_gbp=None,
+            text="3,400-acre tenanted estate", has_named_person=True)
+        self.assertIsNotNone(sale.investable_mid_gbp, "a land sale is realised cash")
+        self.assertTrue(sale.is_realised)
+        self.assertIsNone(holding.investable_mid_gbp, "owning land is not selling it")
+        self.assertIsNotNone(holding.not_estimated_reason)
+
+
 class TestStorage(unittest.TestCase):
     """The database has to survive the move from counties to markets with the
     records intact, because a user's book is the one thing here that is theirs."""

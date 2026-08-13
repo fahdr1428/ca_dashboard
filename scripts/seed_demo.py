@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import json  # noqa: E402
 
 from wealthscan import db  # noqa: E402
+from wealthscan.exclusions import screen  # noqa: E402
 from wealthscan.extract import extract_event  # noqa: E402
 from wealthscan.report import generate_and_store  # noqa: E402
 from wealthscan.research import _store_event  # noqa: E402
@@ -270,12 +271,6 @@ ARTICLES: list[Article] = [
         "Zawya Deals", 13, "business_exit", "kw-kuwait",
     ),
     (
-        "Tel Aviv cybersecurity group Herzliya Shield Ltd acquired for $780m",
-        "Co-founder and chief executive Noa Ben-Ezra has agreed the sale to a US acquirer. "
-        "The Israeli company was founded in 2017.",
-        "Reuters Deals", 4, "acquisition", "il-tel-aviv",
-    ),
-    (
         "Manama fintech secures BHD 42m growth round",
         "Chief executive Layla Al Khalifa said the Bahrain company would expand across the "
         "Gulf. The round was led by a regional fund.",
@@ -346,6 +341,27 @@ ARTICLES: list[Article] = [
         "Founder Rohan Deshmukh has sold his shareholding to a strategic investor.",
         "Reuters Deals", 8, "business_exit", "in-india",
     ),
+    # ------------------------- Land, estate and listed-company pay -------------
+    # The two sources a news-driven tool would otherwise never surface.
+    (
+        "Wiltshire estate sells 1,200 acres of farmland for £14.8m",
+        "The Chalke Valley land has been sold by owner Hugh Fanshawe-Barrow, whose "
+        "family have farmed near Salisbury since the 1920s.",
+        "Insider Media South West", 5, "land_sale", "uk-wiltshire",
+    ),
+    (
+        "Dorset landowner puts tenanted estate into a family partnership",
+        "Landowner Verity Crabbe has restructured the 3,400-acre estate near Blandford "
+        "ahead of a generational handover. No figures were disclosed.",
+        "The Business Magazine", 9, "landholding", "uk-dorset",
+    ),
+    (
+        "Bristol plc chief executive's pay package reaches £2.4m",
+        "The remuneration report shows chief executive Fenella Rooksby received a "
+        "£640,000 salary, an annual bonus and long-term incentive awards. Avon Gorge "
+        "Utilities PLC also disclosed her director shareholding.",
+        "Insider Media South West", 3, "exec_comp", "uk-bristol",
+    ),
     # ------------------------------------------------------- Deliberate non-prospects
     # A real transaction with no individual named. The pipeline must record it as a
     # company lead, not invent a person.
@@ -362,7 +378,42 @@ ARTICLES: list[Article] = [
         "The New Zealand city has agreed funding for the building.",
         "BusinessLive National", 3, "acquisition", "uk-somerset",
     ),
+    # A genuine £40m transaction attached to a genuine named person — and still
+    # not a prospect, because sport and entertainment wealth is not a realistic
+    # introduction. The screening must catch this, not the advisor.
+    (
+        "Former Premier League footballer sells Surrey property empire for £40m",
+        "Striker Callum Aldridge-Vane, who signed for Chelsea FC in 2011, has sold "
+        "the business he built after retiring from the game.",
+        "Sky News Business", 4, "business_exit", "uk-surrey",
+    ),
 ]
+
+#: URLs override the demo's placeholder host, to exercise the banned-source rule.
+SOURCE_URL_OVERRIDES: dict[int, str] = {}
+
+
+def _register_banned_source_example() -> int:
+    """Add one article whose *source* is disqualifying, whatever it says.
+
+    An aggregator "net worth" page can look like perfectly good evidence — a
+    name, a county, a figure. Refusing it on the domain rather than the content
+    is the only rule that holds.
+    """
+    ARTICLES.append((
+        "Gloucestershire haulage boss net worth revealed at £22 million",
+        "Owner Desmond Wraycott has sold his stake in the Cheltenham firm, "
+        "according to estimates.",
+        "Celebrity Net Worth", 6, "business_exit", "uk-gloucestershire",
+    ))
+    index = len(ARTICLES) - 1
+    SOURCE_URL_OVERRIDES[index] = (
+        "https://www.celebritynetworth.com/richest-businessmen/desmond-wraycott-net-worth/"
+    )
+    return index
+
+
+_register_banned_source_example()
 
 
 def verify_demo_record(
@@ -438,7 +489,7 @@ def main() -> int:
     db.init_db()
     fetcher = Fetcher(delay=0.0)  # nothing is fetched; the articles are inline
 
-    created = updated = leads = skipped = 0
+    created = updated = leads = skipped = excluded = 0
     # The markets a real sweep would have had selected. Passing it exercises the
     # out-of-scope guard, so the New Zealand story below is rejected rather than
     # filed under the county whose query surfaced it.
@@ -448,7 +499,7 @@ def main() -> int:
         event = extract_event(
             title=title,
             summary=summary,
-            url=f"https://example.invalid/demo/{index}",
+            url=SOURCE_URL_OVERRIDES.get(index, f"https://example.invalid/demo/{index}"),
             publisher=publisher,
             published_at=days_ago(ago),
             query_event_key=event_key,
@@ -458,6 +509,24 @@ def main() -> int:
         if event is None:
             skipped += 1
             print(f"  · rejected (no market or no wealth event): {title[:58]}")
+            continue
+
+        refusal = screen(
+            text=f"{event.title} {event.summary}",
+            person_name=event.people[0].name if event.people else None,
+            job_title=event.people[0].title if event.people else None,
+            url=event.url,
+        )
+        if refusal is not None:
+            excluded += 1
+            with db.connect() as conn:
+                db.record_exclusion(conn, {
+                    "rule": refusal.rule, "reason": refusal.reason,
+                    "person_name": event.people[0].name if event.people else None,
+                    "company": event.company, "title": event.title,
+                    "url": event.url, "publisher": event.publisher,
+                })
+            print(f"  ✕ excluded ({refusal.rule}): {title[:52]}")
             continue
 
         outcome = _store_event(event, fetcher=fetcher, verify_ch=False)
@@ -501,7 +570,7 @@ def main() -> int:
 
     print()
     print(f"Created {created} prospects, corroborated {updated}, "
-          f"{leads} company-level lead(s), {skipped} article(s) rejected.")
+          f"{leads} company-level lead(s), {skipped} rejected, {excluded} excluded by screening.")
     print(f"Research document written for {payload['week']}.")
     print()
     print("Every person and company in this dataset is FICTIONAL.")
