@@ -56,6 +56,49 @@ that is created and then hidden still turns up in exports and totals:
 Every refusal is logged with its reason on the **Screened out** page. A screening
 rule you cannot inspect is indistinguishable from a bug.
 
+### Is this actually a prospect?
+
+An article about a business sale names four kinds of person, and only one of them
+is the target: the **owner** who sold, the **buyer** (often a private equity
+partner), the **adviser** who ran the process, and a **commentator** quoted for a
+line of colour. Extracting all four is what makes a prospect list feel random.
+
+The app now reads the sentence around each name and refuses the ones who are
+structurally not the target — sentence by sentence, never by character window,
+because "Founder Priya Nadkarni has sold her stake. Partner at Meridian Capital
+James Fowler said…" puts the seller and the buyer forty characters apart and a
+fixed window refuses both. Refusals are logged on **Screened out** like any other.
+
+Survivors are graded:
+
+| State | Means | In the default view? |
+| --- | --- | --- |
+| **Confirmed** | Matched to a company register — the person exists and their connection to the company is a matter of record | Yes |
+| **Corroborated** | Company *and* role established from reliable reporting | Yes |
+| **Unconfirmed** | A name that appeared near a deal. No company, no role, or a single thin source | No — its own **Needs checking** queue |
+
+The practical test is whether a record can be **researched anywhere else**: a name
+with a company behind it can be looked up in Companies House or a company
+database; a name on its own cannot, and no amount of press coverage changes that.
+Corroboration is not a substitute for an entity.
+
+Each record shows its checklist — which checks passed, which did not, and the
+single next step that would move it up a tier.
+
+### Sector
+
+From the company's **filed SIC codes** where Companies House is connected, which
+the company chose and refiles annually. Otherwise inferred from the wording and
+labelled *inferred*, never blended with the filed version.
+
+### Taking it elsewhere
+
+**Company list for research** exports one row per person keyed on the company and
+its Companies House number — the shape a company research platform can actually
+resolve. Records with no company are left out, because they cannot be looked up
+anywhere. Estimate columns are suffixed `_ESTIMATE` so they cannot be mistaken
+for filed figures downstream.
+
 ### Reaching them
 
 Each record carries a **How to reach them** panel, ranked warmest first. The best
@@ -327,6 +370,8 @@ wealthscan/
   exclusions.py             Who is refused, and which sources are never acceptable
   evidence.py               Source-directness grading: High / Medium / Low
   outreach.py               Contact routes, adviser extraction, and the refusals
+  legitimacy.py             Who is really a prospect, and how well verified
+  sectors.py                Filed SIC codes first, keyword inference second
   queries.py                14 wealth-event templates, depths, the query matrix
   extract.py                Money, people, companies, event classification
   scoring.py                Estimates (or a stated reason), and confidence
@@ -337,7 +382,7 @@ wealthscan/
 scripts/
   run_research.py           CLI for a scheduler
   seed_demo.py              52 fictional prospects
-tests_py/test_research.py   82 tests
+tests_py/test_research.py   91 tests
 ```
 
 Run the tests with `python -m unittest discover -s tests_py -v`.

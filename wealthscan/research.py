@@ -21,9 +21,11 @@ from typing import Callable
 from . import db
 from .evidence import classify_source, grade_record
 from .exclusions import screen
+from .legitimacy import assess, refuse_by_role
 from .extract import ExtractedEvent, extract_event
 from .markets import MARKET_BY_KEY, expand_selection
 from .outreach import extract_advisers
+from .sectors import classify as classify_sector
 from .queries import (
     DEFAULT_DEPTH,
     DEPTH_BY_KEY,
@@ -31,7 +33,12 @@ from .queries import (
     PUBLISHER_FEEDS,
     build_search_matrix,
 )
-from .scoring import cohort_for, estimate_from_event, score_confidence
+from .scoring import (
+    TRUSTED_PUBLISHERS,
+    cohort_for,
+    estimate_from_event,
+    score_confidence,
+)
 from .sources import (
     Fetcher,
     fetch_feed,
@@ -330,10 +337,34 @@ def _store_event(
             })
         return {"kind": "company_lead", "name": event.company or event.title, "ch_warning": None}
 
+    text = f"{event.title}. {event.summary}"
+
+    # An article about a business sale names the seller, the buyer, the adviser
+    # and whoever was quoted. Only the first is a prospect. Reading the clause
+    # around each name separates them; extracting all four is what makes a list
+    # feel random.
+    principals = []
+    for person in event.people:
+        refusal = refuse_by_role(text, person.name)
+        if refusal is None:
+            principals.append(person)
+            continue
+        with db.connect() as conn:
+            db.record_exclusion(conn, {
+                "rule": f"not-the-principal ({refusal.marker})",
+                "reason": f"{person.name} is {refusal.reason} — “{refusal.evidence}”.",
+                "person_name": person.name, "company": event.company,
+                "title": event.title, "url": event.url, "publisher": event.publisher,
+            })
+
+    if not principals:
+        return {"kind": "company_lead", "name": event.company or event.title,
+                "ch_warning": None}
+
     outcomes = [
         _store_person(event, person, fetcher=fetcher, verify_ch=verify_ch,
-                      co_principals=len(event.people))
-        for person in event.people
+                      co_principals=len(principals))
+        for person in principals
     ]
     created = [o for o in outcomes if o["kind"] == "new"]
     return {
@@ -406,11 +437,42 @@ def _store_person(
             location_from_text=event.market_source == "text",
         )
 
+        trusted = any(
+            marker in (event.publisher or "").lower() for marker in TRUSTED_PUBLISHERS
+        )
+        standing = assess(
+            name=person.name,
+            job_title=person.title or None,
+            company=event.company,
+            publisher=event.publisher,
+            source_count=prior_sources + 1,
+            register_matched=bool(ch_match and ch_match.matched_via),
+            ownership_filed=stake_verified,
+            text=f"{event.title}. {event.summary}",
+            trusted_publisher=trusted,
+        )
+        sector = classify_sector(
+            sic_codes=list(ch_match.sic_codes) if ch_match else None,
+            company=event.company,
+            text=f"{event.title}. {event.summary}",
+        )
+
         record = {
             "slug": slug,
             "full_name": person.name,
             "job_title": person.title,
             "company": event.company,
+            "verification_state": standing.state,
+            "legitimacy_score": standing.score,
+            "legitimacy_checks": json.dumps([
+                {"label": c.label, "passed": c.passed, "why": c.detail}
+                for c in standing.checks
+            ]),
+            "legitimacy_next_step": standing.next_step,
+            "sector": sector.sector,
+            "sector_basis": sector.basis,
+            "sector_detail": sector.detail,
+            "sic_codes": json.dumps(list(ch_match.sic_codes)) if ch_match else None,
             "market_key": event.market_key,
             "market_name": event.market_name,
             "market_group": event.market_group,

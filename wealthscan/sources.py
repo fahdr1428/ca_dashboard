@@ -209,6 +209,9 @@ class CompaniesHouseMatch:
     registered_office: str | None = None
     company_status: str | None = None
     incorporated_on: str | None = None
+    #: Filed SIC codes. The company chose them and refiles them annually, which
+    #: makes them the only non-guessed statement of what it actually does.
+    sic_codes: tuple[str, ...] = ()
     #: Where the person appears in the filings: 'psc', 'officer', or None.
     matched_via: str | None = None
 
@@ -504,6 +507,7 @@ def verify_with_companies_house(
             ),
             company_status=profile.get("company_status") or best.get("company_status"),
             incorporated_on=profile.get("date_of_creation"),
+            sic_codes=tuple(profile.get("sic_codes") or ()),
         )
 
         if not person_name:

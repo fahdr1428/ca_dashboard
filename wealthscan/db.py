@@ -68,6 +68,19 @@ CREATE TABLE IF NOT EXISTS prospects (
     evidence_grade       TEXT NOT NULL DEFAULT 'Low',
     evidence_basis       TEXT,
     wealth_source        TEXT,
+    -- Has this person actually been checked, or did their name merely appear
+    -- near a deal? Confirmed = matched to a company register. Corroborated =
+    -- company and role established from reliable reporting. Unconfirmed = a name.
+    verification_state   TEXT NOT NULL DEFAULT 'Unconfirmed',
+    legitimacy_score     INTEGER NOT NULL DEFAULT 0,
+    legitimacy_checks    TEXT,
+    legitimacy_next_step TEXT,
+    -- What the business does. 'filed' comes from the company's own SIC codes;
+    -- 'inferred' is read from the text and says so.
+    sector               TEXT,
+    sector_basis         TEXT,
+    sector_detail        TEXT,
+    sic_codes            TEXT,
     wealth_band          TEXT NOT NULL DEFAULT 'Not estimated',
     cohort               TEXT NOT NULL DEFAULT 'Research lead',
     estimate_method      TEXT,
@@ -217,6 +230,8 @@ CREATE TABLE IF NOT EXISTS exclusions (
 CREATE INDEX IF NOT EXISTS idx_exclusions_rule ON exclusions(rule);
 
 CREATE INDEX IF NOT EXISTS idx_prospects_market ON prospects(market_key);
+CREATE INDEX IF NOT EXISTS idx_prospects_verified ON prospects(verification_state);
+CREATE INDEX IF NOT EXISTS idx_prospects_sector ON prospects(sector);
 CREATE INDEX IF NOT EXISTS idx_prospects_country ON prospects(country);
 CREATE INDEX IF NOT EXISTS idx_prospects_investable ON prospects(investable_mid_gbp);
 CREATE INDEX IF NOT EXISTS idx_prospects_week ON prospects(first_seen_week);
@@ -245,6 +260,14 @@ ADDED_COLUMNS: dict[str, tuple[tuple[str, str], ...]] = {
         ("evidence_grade", "TEXT NOT NULL DEFAULT 'Low'"),
         ("evidence_basis", "TEXT"),
         ("wealth_source", "TEXT"),
+        ("verification_state", "TEXT NOT NULL DEFAULT 'Unconfirmed'"),
+        ("legitimacy_score", "INTEGER NOT NULL DEFAULT 0"),
+        ("legitimacy_checks", "TEXT"),
+        ("legitimacy_next_step", "TEXT"),
+        ("sector", "TEXT"),
+        ("sector_basis", "TEXT"),
+        ("sector_detail", "TEXT"),
+        ("sic_codes", "TEXT"),
     ),
     "runs": (
         ("depth", "TEXT"),

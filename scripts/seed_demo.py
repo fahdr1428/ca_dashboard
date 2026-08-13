@@ -381,6 +381,14 @@ ARTICLES: list[Article] = [
         "The New Zealand city has agreed funding for the building.",
         "BusinessLive National", 3, "acquisition", "uk-somerset",
     ),
+    # Two names, one prospect. The founder sold; the private equity partner
+    # bought and was quoted. Extracting both is what makes a list feel random.
+    (
+        "Taunton renewables group Quantock Energy Ltd sold to Meridian for £73m",
+        "Founder Priya Nadkarni has sold her stake in the Somerset business. Partner "
+        "at Meridian Capital James Fowler said the company had strong fundamentals.",
+        "Insider Media South West", 3, "business_exit", "uk-somerset",
+    ),
     # A genuine £40m transaction attached to a genuine named person — and still
     # not a prospect, because sport and entertainment wealth is not a realistic
     # introduction. The screening must catch this, not the advisor.
@@ -454,6 +462,10 @@ def verify_demo_record(
                    ch_company_number = ?, ch_company_name = ?, ch_officer_name = ?,
                    ch_ownership_band = ?, ch_registered_office = ?, ch_profile_url = ?,
                    ch_verified_at = ?, address = ?,
+                   verification_state = 'Confirmed', legitimacy_score = 100,
+                   sector = 'Manufacturing & engineering', sector_basis = 'filed',
+                   sector_detail = 'From the company''s filed SIC code 25620.',
+                   sic_codes = '["25620"]',
                    gross_low_gbp = ?, gross_mid_gbp = ?, gross_high_gbp = ?,
                    investable_low_gbp = ?, investable_mid_gbp = ?, investable_high_gbp = ?,
                    wealth_band = ?, cohort = ?, estimate_method = ?, estimate_caveats = ?,

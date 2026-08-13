@@ -34,6 +34,11 @@ from wealthscan.config import (
     QUALIFYING_THRESHOLD_GBP,
 )
 from wealthscan.evidence import GRADE_ORDER, TIERS
+from wealthscan.legitimacy import (
+    DEFAULT_VISIBLE_STATES,
+    STATE_ORDER,
+    UNCONFIRMED,
+)
 from wealthscan.exclusions import BANNED_SOURCE_DOMAINS, MEGA_WEALTH_CEILING_GBP
 from wealthscan.markets import (
     ALL_MARKETS,
@@ -54,6 +59,7 @@ from wealthscan.queries import (
     plan_sweep,
 )
 from wealthscan.outreach import REFUSED_ROUTES, contact_routes
+from wealthscan.sectors import SECTORS
 from wealthscan.report import fmt_gbp, generate_and_store
 from wealthscan.research import resolve_lead_with_register, run_research
 from wealthscan.sources import companies_house_available, companies_house_status
@@ -549,6 +555,9 @@ QUICK_VIEWS: dict[str, str] = {
     "£1m+ a year": "Qualifying on income rather than assets — dividends and listed pay.",
     "Land & estates": "Agricultural, estate and landowner wealth.",
     "Filed evidence": "Only records whose strongest source is a statutory filing.",
+    "Needs checking": "Names that appeared near a deal but have not been verified — "
+                      "no company, no role, or a single thin source. Research these "
+                      "before they earn a place in the book.",
 }
 
 
@@ -566,6 +575,8 @@ def _apply_quick_view(frame: pd.DataFrame, view_name: str) -> pd.DataFrame:
         return frame[frame["wealth_source"].fillna("") == "Land, estate or farming"]
     if view_name == "Filed evidence":
         return frame[frame["evidence_grade"] == "High"]
+    if view_name == "Needs checking":
+        return frame[frame["verification_state"] == UNCONFIRMED]
     return frame
 
 
@@ -628,6 +639,21 @@ def _detailed_filters(
             "Cohort", sorted(frame["cohort"].dropna().unique()), placeholder="Any cohort",
         )
 
+        checks = st.columns([1.5, 1.5])
+        states = checks[0].multiselect(
+            "Verification",
+            [s for s in STATE_ORDER if s in set(frame["verification_state"].dropna())],
+            default=[s for s in DEFAULT_VISIBLE_STATES
+                     if s in set(frame["verification_state"].dropna())],
+            help="Confirmed = matched to a company register. Corroborated = company "
+                 "and role established from reliable reporting. Unconfirmed = a name "
+                 "that appeared near a deal, and nothing more.",
+        )
+        sectors = checks[1].multiselect(
+            "Sector", [s for s in SECTORS if s in set(frame["sector"].dropna())],
+            placeholder="Any sector",
+        )
+
         wealth_sources = st.multiselect(
             "Where the wealth comes from",
             sorted(frame["wealth_source"].dropna().unique()),
@@ -679,6 +705,12 @@ def _detailed_filters(
         view = view[view["company_status"].isin(statuses)]
     if grades:
         view = view[view["evidence_grade"].isin(grades)]
+    # "Needs checking" is explicitly asking for the unverified, so the default
+    # verification filter must not silently empty it.
+    if states and quick != "Needs checking":
+        view = view[view["verification_state"].isin(states)]
+    if sectors:
+        view = view[view["sector"].isin(sectors)]
     if cohorts:
         view = view[view["cohort"].isin(cohorts)]
     if wealth_sources:
@@ -695,6 +727,57 @@ def _detailed_filters(
 
     column, ascending = SORTS[sort_label]
     return view.sort_values(column, ascending=ascending, na_position="last")
+
+
+def _company_export(view: pd.DataFrame) -> str:
+    """Company-anchored CSV, for pushing into a company research platform.
+
+    Keyed on the company and its registration number rather than on the person,
+    because that is what a company database can actually resolve. A person\'s name
+    on its own matches nothing.
+    """
+    if view.empty:
+        return "no companies to export\n"
+
+    export = pd.DataFrame({
+        "company_name": view["ch_company_name"].fillna(view["company"]),
+        "companies_house_number": view["company_number"].fillna(view["ch_company_number"]),
+        "company_status": view["company_status"].fillna(""),
+        "sector": view["sector"].fillna(""),
+        "sector_basis": view["sector_basis"].fillna(""),
+        "sic_codes": view["sic_codes"].fillna(""),
+        "registered_office": view["ch_registered_office"].fillna(view["address"]),
+        "country": view["country"].fillna(""),
+        "market": view["market_name"].fillna(""),
+        "locality": view["locality"].fillna(""),
+        "person_name": view["full_name"],
+        "person_role": view["job_title"].fillna(""),
+        "ownership_band_filed": view["ch_ownership_band"].fillna(""),
+        "verification_state": view["verification_state"].fillna(""),
+        "evidence_grade": view["evidence_grade"].fillna(""),
+        "confidence_0_100": view["confidence"],
+        "wealth_event": view["primary_event"].fillna(""),
+        "wealth_source": view["wealth_source"].fillna(""),
+        "est_investable_gbp_ESTIMATE": view["investable_mid_gbp"],
+        "est_investable_low_gbp_ESTIMATE": view["investable_low_gbp"],
+        "est_investable_high_gbp_ESTIMATE": view["investable_high_gbp"],
+        "est_annual_income_gbp_ESTIMATE": view["annual_income_gbp"],
+        "known_adviser": view["known_adviser"].fillna(""),
+        "latest_newsflow": view["latest_newsflow"].fillna(""),
+        "first_seen": view["first_seen"],
+    })
+    sources = load_sources_index()
+    export["source_urls"] = [
+        " | ".join(s["url"] for s in sources.get(int(i), []))
+        for i in view["id"]
+    ]
+    header = (
+        "# Company-anchored export. Columns ending _ESTIMATE are MODELLED estimates\n"
+        "# derived from public reporting, not verified statements of wealth.\n"
+        "# verification_state: Confirmed = matched to a company register;\n"
+        "# Corroborated = company and role from reliable reporting; Unconfirmed = a name.\n"
+    )
+    return header + export.to_csv(index=False)
 
 
 def page_list(frame: pd.DataFrame) -> None:
@@ -729,6 +812,8 @@ def page_list(frame: pd.DataFrame) -> None:
         "Est. net worth £": pd.to_numeric(view["investable_mid_gbp"], errors="coerce"),
         "Co. revenue £": pd.to_numeric(view["company_revenue_gbp"], errors="coerce"),
         "Est. income £": pd.to_numeric(view["annual_income_gbp"], errors="coerce"),
+        "Verified": view["verification_state"].fillna("Unconfirmed"),
+        "Sector": view["sector"].fillna("—"),
         "Evidence": view["evidence_grade"].fillna("Low"),
         "Confidence": view["confidence"],
         "Wealth source": view["wealth_source"].fillna("—"),
@@ -770,6 +855,13 @@ def page_list(frame: pd.DataFrame) -> None:
                      "for listed-company pay; modelled from an assumed stake for "
                      "dividends. Blank means not publicly disclosed.",
             ),
+            "Verified": st.column_config.TextColumn(
+                "Verified", width="small",
+                help="Confirmed = matched to a company register. Corroborated = "
+                     "company and role established from reliable reporting. "
+                     "Unconfirmed = a name that appeared near a deal.",
+            ),
+            "Sector": st.column_config.TextColumn(width="medium"),
             "Evidence": st.column_config.TextColumn(
                 "Evidence", width="small",
                 help="How direct the strongest source is. High = a statutory filing "
@@ -807,7 +899,9 @@ def page_list(frame: pd.DataFrame) -> None:
     )
 
     estimate_disclaimer()
-    st.download_button(
+
+    downloads = st.columns([1, 1, 2])
+    downloads[0].download_button(
         "Download this list as CSV",
         data=(
             "# All monetary figures are MODELLED ESTIMATES from public reporting, "
@@ -816,6 +910,24 @@ def page_list(frame: pd.DataFrame) -> None:
         ),
         file_name=f"prospects-{datetime.now(timezone.utc):%Y-%m-%d}.csv",
         mime="text/csv",
+        width="stretch",
+    )
+    researchable = view[view["company"].notna()]
+    downloads[1].download_button(
+        "Company list for research",
+        data=_company_export(researchable),
+        file_name=f"companies-{datetime.now(timezone.utc):%Y-%m-%d}.csv",
+        mime="text/csv",
+        disabled=researchable.empty,
+        width="stretch",
+        help="One row per person, keyed on the company and its Companies House "
+             "number — the shape a company database can look up. Records with no "
+             "company are left out, because they cannot be researched anywhere.",
+    )
+    downloads[2].caption(
+        f"{len(researchable)} of {len(view)} shown records name a company and can be "
+        f"looked up in Companies House or a company database. The rest are names "
+        f"without an entity behind them."
     )
 
     rows = list(getattr(selection, "selection", {}).get("rows", []) or [])
@@ -855,6 +967,20 @@ def render_prospect_detail(row: pd.Series) -> None:
     )
     if present(row, "evidence_basis"):
         st.caption(row["evidence_basis"])
+
+    with st.expander(
+        f"Verification — {row['verification_state'] if present(row, 'verification_state') else 'Unconfirmed'}"
+        f" ({int(row['legitimacy_score']) if present(row, 'legitimacy_score') else 0}% of checks passed)",
+        expanded=(not present(row, "verification_state")
+                  or str(row["verification_state"]) == "Unconfirmed"),
+    ):
+        for check in (json.loads(row["legitimacy_checks"])
+                      if present(row, "legitimacy_checks") else []):
+            st.markdown(
+                f"{'✅' if check['passed'] else '⬜'} **{check['label']}** — {check['why']}"
+            )
+        if present(row, "legitimacy_next_step"):
+            st.info(f"**To verify further** — {row['legitimacy_next_step']}")
 
     left, right = st.columns([1.5, 1])
 
@@ -899,9 +1025,16 @@ def render_prospect_detail(row: pd.Series) -> None:
             else "not disclosed",
         )
         facts[2].metric(
-            "Wealth source",
-            str(row["wealth_source"]) if present(row, "wealth_source") else "—",
+            "Sector",
+            str(row["sector"]) if present(row, "sector") else "—",
+            help=str(row["sector_detail"]) if present(row, "sector_detail") else None,
         )
+        if present(row, "sector_basis") and str(row["sector_basis"]) == "inferred":
+            st.caption(
+                "Sector is inferred from the wording of the source, not from a filed "
+                "SIC code. Connect Companies House to replace the guess with the "
+                "company's own classification."
+            )
         if present(row, "annual_income_basis"):
             st.markdown(
                 f'<div class="reason"><strong>Income basis:</strong> '

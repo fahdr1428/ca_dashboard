@@ -614,6 +614,113 @@ class TestPeopleFirst(unittest.TestCase):
         self.assertEqual(_titlecase_filed_name("SMITH-JONES, Peter"), "Peter Smith-Jones")
 
 
+class TestLegitimacy(unittest.TestCase):
+    """An article about a business sale names four kinds of person and only one
+    of them is a prospect. Telling them apart is the difference between a book
+    and a list of names that happened to be near a deal."""
+
+    def test_the_buyer_and_the_adviser_are_not_prospects(self):
+        from wealthscan.legitimacy import refuse_by_role
+        text = (
+            "Founder Priya Nadkarni has sold her stake in the Somerset business. "
+            "Partner at Meridian Capital James Fowler said the company had strong "
+            "fundamentals."
+        )
+        self.assertIsNone(refuse_by_role(text, "Priya Nadkarni"), "the seller stays")
+        refusal = refuse_by_role(text, "James Fowler")
+        self.assertIsNotNone(refusal, "the buyer's partner goes")
+        self.assertEqual(refusal.marker, "buy-side")
+
+    def test_context_is_read_one_sentence_at_a_time(self):
+        """A fixed character window puts the seller and the buyer inside the same
+        context and refuses both — losing a real prospect to catch a fake one."""
+        from wealthscan.legitimacy import refuse_by_role
+        text = (
+            "PKF Francis Clark advised the shareholders. Corporate finance partner "
+            "Sarah Vane led the team. Chairman Gareth Halberton has sold the business."
+        )
+        self.assertIsNone(refuse_by_role(text, "Gareth Halberton"))
+        self.assertEqual(refuse_by_role(text, "Sarah Vane").marker, "adviser")
+
+    def test_commentators_are_refused(self):
+        from wealthscan.legitimacy import refuse_by_role
+        for text, name in [
+            ("A spokesman for the council, Peter Wills, welcomed the investment.",
+             "Peter Wills"),
+            ("Analyst at Peel Hunt Dora Vance said the price looked full.", "Dora Vance"),
+            ("Council leader Marcus Ord said the jobs were welcome.", "Marcus Ord"),
+        ]:
+            refusal = refuse_by_role(text, name)
+            self.assertIsNotNone(refusal, name)
+            self.assertEqual(refusal.marker, "commentator", name)
+
+    def test_states_reflect_what_was_actually_checked(self):
+        from wealthscan.legitimacy import assess
+
+        confirmed = assess(
+            name="Gareth Halberton", job_title="Chairman",
+            company="Halberton Precision Ltd", publisher="BusinessLive",
+            source_count=1, register_matched=True, ownership_filed=True,
+            trusted_publisher=True, text="has sold the business")
+        corroborated = assess(
+            name="Gareth Halberton", job_title="Chairman",
+            company="Halberton Precision Ltd", publisher="BusinessLive",
+            source_count=1, register_matched=False, ownership_filed=False,
+            trusted_publisher=True, text="has sold the business")
+        unconfirmed = assess(
+            name="Someone Vague", job_title=None, company=None,
+            publisher="somebodysblog.example", source_count=1,
+            register_matched=False, ownership_filed=False,
+            trusted_publisher=False, text="said")
+
+        self.assertEqual(confirmed.state, "Confirmed")
+        self.assertEqual(corroborated.state, "Corroborated")
+        self.assertEqual(unconfirmed.state, "Unconfirmed")
+        self.assertGreater(confirmed.score, corroborated.score)
+        self.assertGreater(corroborated.score, unconfirmed.score)
+
+    def test_a_name_with_no_company_cannot_be_researched(self):
+        """The practical test: a name with a company behind it can be looked up
+        in Companies House or a company database. A name alone cannot, and no
+        amount of press coverage changes that."""
+        from wealthscan.legitimacy import assess
+        without = assess(
+            name="Someone Vague", job_title="Founder", company=None,
+            publisher="BBC", source_count=3, register_matched=False,
+            ownership_filed=False, trusted_publisher=True, text="sold up")
+        self.assertFalse(without.is_researchable)
+        self.assertEqual(without.state, "Unconfirmed",
+                         "corroboration cannot substitute for an entity")
+        self.assertIn("Identify the company", without.next_step)
+
+    def test_default_view_excludes_the_unverified(self):
+        from wealthscan.legitimacy import DEFAULT_VISIBLE_STATES
+        self.assertNotIn("Unconfirmed", DEFAULT_VISIBLE_STATES)
+        self.assertIn("Confirmed", DEFAULT_VISIBLE_STATES)
+
+
+class TestSectors(unittest.TestCase):
+    def test_filed_sic_beats_inference(self):
+        from wealthscan.sectors import classify
+        guess = classify(
+            sic_codes=["25620"], company="Halberton Precision Ltd",
+            text="a software platform for cloud analytics",
+        )
+        self.assertEqual(guess.sector, "Manufacturing & engineering")
+        self.assertEqual(guess.basis, "filed", "a filing outranks the wording")
+
+    def test_inference_is_labelled_as_inference(self):
+        from wealthscan.sectors import classify
+        guess = classify(company="Wytham Bio Ltd", text="Oxford biotech secures £54m")
+        self.assertEqual(guess.sector, "Healthcare & life sciences")
+        self.assertEqual(guess.basis, "inferred")
+        self.assertIn("not from a filing", guess.detail)
+
+    def test_unknown_is_other_rather_than_a_guess(self):
+        from wealthscan.sectors import classify
+        self.assertEqual(classify(company=None, text="a business was sold").sector, "Other")
+
+
 class TestOutreach(unittest.TestCase):
     """Reaching a prospect. The warm route is the adviser who did the deal; the
     routes this refuses to build matter as much as the ones it does."""
