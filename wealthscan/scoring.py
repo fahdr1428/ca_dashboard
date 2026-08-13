@@ -131,13 +131,22 @@ def estimate_from_event(
     text: str,
     has_named_person: bool,
     known_stake_band: str | None = None,
+    co_principals: int = 1,
 ) -> Estimate:
     """Estimate an individual's position from one reported event.
 
     ``known_stake_band`` is a filed PSC band such as "50–75%". When supplied it
     replaces the assumed shareholding — which removes the single largest source
     of error, and means the output must no longer describe the stake as assumed.
+
+    ``co_principals`` is how many individuals the source names for the same
+    transaction. Storing all of them is right — an article naming two co-founders
+    describes two prospects, and keeping only the first threw one away — but
+    giving each of them the whole founder stake would report £64m three times
+    over. The assumed stake is divided between them instead, and the record says
+    so. A *filed* band is never divided: that is their actual shareholding.
     """
+    co_principals = max(1, int(co_principals))
 
     none_estimate = lambda reason: Estimate(  # noqa: E731 - terse by design
         None, None, None, None, None, None,
@@ -182,10 +191,12 @@ def estimate_from_event(
         if filed:
             lows, mids, highs = filed
         else:
+            # Split between everyone the source names, or the same transaction
+            # gets counted once per co-founder.
             lows, mids, highs = (
-                MODEL.assumed_founder_stake_low,
-                MODEL.assumed_founder_stake_mid,
-                MODEL.assumed_founder_stake_high,
+                MODEL.assumed_founder_stake_low / co_principals,
+                MODEL.assumed_founder_stake_mid / co_principals,
+                MODEL.assumed_founder_stake_high / co_principals,
             )
         after_tax = 1 - MODEL.exit_tax_rate
         gross_low = int(amount_gbp * lows * after_tax)
@@ -226,7 +237,12 @@ def estimate_from_event(
                     "The stake is an assumption and is the single largest source of error "
                     "in this figure — verify it on the Companies House PSC register before "
                     "relying on it.",
-                ]
+                ] + ([
+                    f"The source names {co_principals} principals for this transaction, so "
+                    f"the assumed founder stake is split equally between them. Real splits "
+                    f"are rarely equal — a lead founder usually holds more — so treat this "
+                    f"as a floor for whoever led the business.",
+                ] if co_principals > 1 else [])
             ) + [
                 "Reported transaction values often include debt, deferred "
                 "consideration or earn-outs that never reach the seller.",

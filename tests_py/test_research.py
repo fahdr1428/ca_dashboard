@@ -538,6 +538,82 @@ class TestOwnershipBands(unittest.TestCase):
         self.assertGreater(filed.gross_mid_gbp, assumed.gross_mid_gbp)
 
 
+class TestPeopleFirst(unittest.TestCase):
+    """The app exists to find people, not deals. These pin the difference."""
+
+    def test_both_names_in_a_pair_are_found(self):
+        """"Alice and Ruth have sold" is two prospects. Only the second sits next
+        to the verb, so the first used to be dropped silently."""
+        for text in [
+            "Co-founders Alice Marchmont and Ruth Pelling have sold the business.",
+            "The company was founded by Alice Marchmont and Ruth Pelling in 2009.",
+        ]:
+            names = [p.name for p in extract_people(text)]
+            self.assertIn("Alice Marchmont", names, text)
+            self.assertIn("Ruth Pelling", names, text)
+
+    def test_co_principals_split_the_assumed_stake(self):
+        """Storing every named person is right; giving each of them the whole
+        founder stake would report the same £60m two or three times over."""
+        solo = estimate_from_event(
+            event_key="business_exit", amount_gbp=60_000_000,
+            text="sold", has_named_person=True)
+        pair = estimate_from_event(
+            event_key="business_exit", amount_gbp=60_000_000,
+            text="sold", has_named_person=True, co_principals=2)
+        self.assertEqual(pair.gross_mid_gbp * 2, solo.gross_mid_gbp)
+        self.assertTrue(any("split equally" in c for c in pair.caveats))
+        self.assertFalse(any("split equally" in c for c in solo.caveats))
+
+    def test_a_filed_stake_is_never_divided(self):
+        """A PSC band is that person's actual shareholding, not a share of one."""
+        alone = estimate_from_event(
+            event_key="business_exit", amount_gbp=60_000_000, text="sold",
+            has_named_person=True, known_stake_band="50–75%")
+        among_three = estimate_from_event(
+            event_key="business_exit", amount_gbp=60_000_000, text="sold",
+            has_named_person=True, known_stake_band="50–75%", co_principals=3)
+        self.assertEqual(alone.gross_mid_gbp, among_three.gross_mid_gbp)
+
+    def test_unnamed_transactions_are_kept_as_a_worklist(self):
+        """A £30m disposal with no name is not waste — the register knows whose
+        it was. Discarding it threw away the best raw material the sweep has."""
+        import tempfile
+        from wealthscan import db
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "leads.db"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                self.assertTrue(db.record_company_lead(conn, {
+                    "company": "Plymouth Robotics Ltd", "market_key": "uk-devon",
+                    "market_name": "Devon", "country": "United Kingdom",
+                    "amount_gbp": 30_000_000, "title": "Plymouth robotics firm sold",
+                    "url": "https://example.invalid/a", "event_key": "acquisition",
+                }))
+                # The same article must not queue the same company twice.
+                self.assertFalse(db.record_company_lead(conn, {
+                    "company": "Plymouth Robotics Ltd", "title": "dup",
+                    "url": "https://example.invalid/a",
+                }))
+                open_leads = db.company_leads(conn, unresolved_only=True)
+                self.assertEqual(len(open_leads), 1)
+                self.assertEqual(open_leads[0]["amount_gbp"], 30_000_000)
+
+                db.resolve_company_lead(
+                    conn, int(open_leads[0]["id"]),
+                    note="2 principals found", people_found=2)
+                self.assertEqual(len(db.company_leads(conn, unresolved_only=True)), 0)
+
+    def test_filed_names_are_made_readable(self):
+        """Companies House files "SMITH, John Andrew" in block capitals. Left as
+        filed it sorts wrongly and never matches the press spelling."""
+        from wealthscan.sources import _titlecase_filed_name
+        self.assertEqual(_titlecase_filed_name("SMITH, John Andrew"), "John Andrew Smith")
+        self.assertEqual(_titlecase_filed_name("O'BRIEN, Mary"), "Mary O'Brien")
+        self.assertEqual(_titlecase_filed_name("SMITH-JONES, Peter"), "Peter Smith-Jones")
+
+
 class TestScreening(unittest.TestCase):
     """What the book refuses to contain.
 

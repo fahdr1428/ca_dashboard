@@ -156,6 +156,34 @@ CREATE TABLE IF NOT EXISTS seen_urls (
     first_seen TEXT NOT NULL
 );
 
+-- Real transactions with no individual named. Previously counted and thrown
+-- away, which discarded the best raw material the sweep produces: a £30m
+-- disposal whose owner the press did not name is still a £30m disposal, and the
+-- register knows whose it was. These are a worklist, not waste.
+CREATE TABLE IF NOT EXISTS company_leads (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- Nullable: some transactions name neither a person nor a company. Those are
+    -- still worth keeping for manual research, but there is nothing to look up.
+    company        TEXT,
+    market_key     TEXT,
+    market_name    TEXT,
+    country        TEXT,
+    locality       TEXT,
+    event_key      TEXT,
+    event_label    TEXT,
+    amount_gbp     INTEGER,
+    title          TEXT NOT NULL,
+    url            TEXT NOT NULL UNIQUE,
+    publisher      TEXT,
+    published_at   TEXT,
+    first_seen     TEXT NOT NULL,
+    -- Set once the register has been asked who owns it.
+    resolved_at    TEXT,
+    resolved_note  TEXT,
+    people_found   INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_company_leads_resolved ON company_leads(resolved_at);
+
 -- Refusals, kept rather than discarded. A screening rule you cannot inspect is
 -- indistinguishable from a bug, and "why is nobody from Hampshire showing up"
 -- is only answerable if the rejections are on record.
@@ -442,6 +470,49 @@ def source_count(conn: sqlite3.Connection, prospect_id: int) -> int:
         "SELECT COUNT(*) AS n FROM sources WHERE prospect_id = ?", (prospect_id,)
     ).fetchone()
     return int(row["n"]) if row else 0
+
+
+def record_company_lead(conn: sqlite3.Connection, lead: dict[str, Any]) -> bool:
+    """Keep a named transaction whose owner is unknown. False if already held."""
+    try:
+        conn.execute(
+            """INSERT INTO company_leads
+               (company, market_key, market_name, country, locality, event_key,
+                event_label, amount_gbp, title, url, publisher, published_at, first_seen)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                lead["company"], lead.get("market_key"), lead.get("market_name"),
+                lead.get("country"), lead.get("locality"), lead.get("event_key"),
+                lead.get("event_label"), lead.get("amount_gbp"), lead["title"],
+                lead["url"], lead.get("publisher"), lead.get("published_at"), now_iso(),
+            ),
+        )
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def company_leads(
+    conn: sqlite3.Connection, *, unresolved_only: bool = False, limit: int = 500
+) -> list[sqlite3.Row]:
+    clause = "WHERE resolved_at IS NULL" if unresolved_only else ""
+    return conn.execute(
+        f"""SELECT * FROM company_leads {clause}
+            ORDER BY CASE WHEN amount_gbp IS NULL THEN 1 ELSE 0 END,
+                     amount_gbp DESC, first_seen DESC
+            LIMIT ?""",
+        (limit,),
+    ).fetchall()
+
+
+def resolve_company_lead(
+    conn: sqlite3.Connection, lead_id: int, *, note: str, people_found: int
+) -> None:
+    conn.execute(
+        "UPDATE company_leads SET resolved_at = ?, resolved_note = ?, people_found = ? "
+        "WHERE id = ?",
+        (now_iso(), note, people_found, lead_id),
+    )
 
 
 def record_exclusion(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:

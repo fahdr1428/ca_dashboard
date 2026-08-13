@@ -143,6 +143,11 @@ _TITLE_WORDS = (
     # and no people, which is the same as not searching for it.
     "landowner", "land owner", "estate owner", "farmer", "farm owner",
     "landlord", "estate manager", "trustee",
+    # Plurals. "Co-founders Alice Marchmont and Ruth Pelling" is one of the
+    # commonest ways two prospects appear in a single sentence, and the singular
+    # forms miss it entirely because of the trailing "s".
+    "founders", "co-founders", "cofounders", "owners", "co-owners", "directors",
+    "shareholders", "brothers", "sisters", "siblings", "partners",
 )
 _TITLE_ACRONYMS = ("CEO", "CFO", "MD", "COO", "CTO", "CSO", "CIO", "CCO")
 
@@ -220,6 +225,17 @@ _PATTERNS: tuple[tuple[re.Pattern[str], int, int], ...] = (
 _AGENT_PATTERN = re.compile(rf"\b(?:{_AGENTS})\s+(?:{_HONORIFIC})?({_NAME})\b")
 #: "Gareth Halberton has sold…" — subject of a wealth verb.
 _SUBJECT_PATTERN = re.compile(rf"\b(?:{_HONORIFIC})?({_NAME})\s+(?:{_SUBJECTS})\b")
+#: "Alice Marchmont and Ruth Pelling have sold…" — two prospects, one sentence.
+#: Without this the first name is silently dropped, because only the second sits
+#: next to the verb.
+_PAIR_PATTERN = re.compile(
+    rf"\b(?:{_HONORIFIC})?({_NAME})\s+and\s+(?:{_HONORIFIC})?({_NAME})"
+    rf"\s+(?:{_SUBJECTS})\b"
+)
+#: "…founded by Alice Marchmont and Ruth Pelling" — same problem, other side.
+_PAIR_AGENT_PATTERN = re.compile(
+    rf"\b(?:{_AGENTS})\s+(?:{_HONORIFIC})?({_NAME})\s+and\s+(?:{_HONORIFIC})?({_NAME})\b"
+)
 
 #: First words that mark a phrase as not a personal name.
 _STOPWORDS = frozenset({
@@ -360,6 +376,13 @@ def extract_people(text: str) -> list[Person]:
     for pattern, name_group, title_group in _PATTERNS:
         for match in pattern.finditer(text):
             add(match.group(name_group), _normalise_title(match.group(title_group)))
+
+    # Pairs first: both halves are wanted, and the singular patterns below would
+    # only ever reach whichever name sits next to the verb.
+    for pattern in (_PAIR_PATTERN, _PAIR_AGENT_PATTERN):
+        for match in pattern.finditer(text):
+            add(match.group(1), "")
+            add(match.group(2), "")
 
     # No title stated in these two, and guessing one would invent detail.
     for match in _AGENT_PATTERN.finditer(text):

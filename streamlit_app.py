@@ -54,7 +54,7 @@ from wealthscan.queries import (
     plan_sweep,
 )
 from wealthscan.report import fmt_gbp, generate_and_store
-from wealthscan.research import run_research
+from wealthscan.research import resolve_lead_with_register, run_research
 from wealthscan.sources import companies_house_available, companies_house_status
 
 st.set_page_config(
@@ -1111,6 +1111,15 @@ def page_overview(frame: pd.DataFrame) -> None:
                       help="Matched to a filed Companies House record")
     estimate_disclaimer()
 
+    with db.connect() as conn:
+        waiting = db.company_leads(conn, unresolved_only=True)
+    if waiting:
+        st.info(
+            f"**{len(waiting)} transactions are sitting behind an unnamed company** — "
+            f"{fmt_gbp(sum(r['amount_gbp'] or 0 for r in waiting))} of reported value with "
+            f"nobody attached. Open **Find the owner** to ask the register who they are."
+        )
+
     if len(unestimated):
         st.caption(
             f"**{len(unestimated)} of these carry no monetary figure.** That is deliberate: "
@@ -1245,6 +1254,112 @@ def page_overview(frame: pd.DataFrame) -> None:
 # ---------------------------------------------------------------------------
 # Page: weekly report
 # ---------------------------------------------------------------------------
+
+
+def page_unnamed_leads() -> None:
+    st.title("Find the owner")
+    st.caption(
+        "Real transactions the press reported without naming anyone. These are not "
+        "waste — a £30m disposal whose owner nobody wrote down is still a £30m "
+        "disposal, and the register knows whose it was."
+    )
+
+    with db.connect() as conn:
+        open_leads = [dict(r) for r in db.company_leads(conn, unresolved_only=True)]
+        done_leads = [dict(r) for r in db.company_leads(conn)]
+    resolved = [r for r in done_leads if r["resolved_at"]]
+
+    columns = st.columns(4)
+    columns[0].metric("Awaiting a name", len(open_leads))
+    columns[1].metric("Already looked up", len(resolved))
+    columns[2].metric(
+        "People found this way", int(sum(r["people_found"] or 0 for r in resolved))
+    )
+    columns[3].metric(
+        "Value with no name",
+        fmt_gbp(sum(r["amount_gbp"] or 0 for r in open_leads)),
+        help="Total reported transaction value sitting behind unnamed companies.",
+    )
+
+    if not companies_house_available():
+        st.warning(
+            "**Companies House is not connected, so these cannot be resolved "
+            "automatically.** With a key, one click turns a company into its filed "
+            "owners — names, roles and shareholding bands stated rather than assumed. "
+            "It is the single highest-yield thing this app can do for finding people. "
+            "See **How it works** for the two-minute setup."
+        )
+
+    if not open_leads:
+        st.info(
+            "Nothing waiting. Every transaction found so far either named someone or "
+            "has already been looked up."
+        )
+    else:
+        st.divider()
+        st.subheader(f"{len(open_leads)} companies to put a name to")
+        st.caption(
+            "Sorted by reported value — the biggest unnamed transactions first, since "
+            "those are where a name is worth the most."
+        )
+        for lead in open_leads[:40]:
+            named = bool(lead["company"])
+            heading = (
+                f"**{lead['company'] if named else 'Company not named in the source'}** · "
+                f"{lead['market_name'] or '—'} · "
+                f"{fmt_gbp(lead['amount_gbp']) if lead['amount_gbp'] else 'value not reported'}"
+                f" · {lead['event_label'] or 'transaction'}"
+            )
+            with st.container(border=True):
+                left, right = st.columns([3.2, 1])
+                left.markdown(heading)
+                left.caption(lead["title"])
+                left.markdown(
+                    f"[Read the source]({lead['url']}) — {lead['publisher'] or 'source'}"
+                )
+                uk = (lead["country"] or "") == "United Kingdom"
+                if right.button(
+                    "Find the owners",
+                    key=f"resolve_{lead['id']}",
+                    disabled=not (companies_house_available() and uk and named),
+                    width="stretch",
+                    help=(
+                        "The source names no company, so there is nothing to look up — "
+                        "read the article and identify it by hand."
+                        if not named else
+                        None if uk else
+                        "Companies House covers the UK only. Resolve this one by hand."
+                    ),
+                ):
+                    with st.spinner(f"Asking the register about {lead['company']}…"):
+                        result = resolve_lead_with_register(int(lead["id"]))
+                    refresh()
+                    if result["created"]:
+                        st.success(result["note"])
+                    else:
+                        st.warning(result["note"])
+                    st.rerun()
+                if named:
+                    right.caption(
+                        f"[Search manually]"
+                        f"(https://find-and-update.company-information.service.gov.uk/search?q="
+                        f"{str(lead['company']).replace(' ', '+')})"
+                    )
+
+    if resolved:
+        st.divider()
+        with st.expander(f"{len(resolved)} already looked up"):
+            st.dataframe(
+                pd.DataFrame([{
+                    "Company": r["company"],
+                    "Where": r["market_name"] or "—",
+                    "Value": fmt_gbp(r["amount_gbp"]),
+                    "People found": r["people_found"],
+                    "Outcome": r["resolved_note"] or "",
+                } for r in resolved]),
+                hide_index=True, width="stretch",
+                column_config={"Outcome": st.column_config.TextColumn(width="large")},
+            )
 
 
 def page_screened_out() -> None:
@@ -1611,6 +1726,7 @@ PAGES = {
     "Overview": lambda: page_overview(frame),
     "Prospect list": lambda: page_list(frame),
     "Find prospects": lambda: page_find(frame),
+    "Find the owner": page_unnamed_leads,
     "Screened out": page_screened_out,
     "Weekly research document": page_research_doc,
     "How it works": page_methodology,

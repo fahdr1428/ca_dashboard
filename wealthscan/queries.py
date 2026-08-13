@@ -48,8 +48,9 @@ EVENT_TEMPLATES: tuple[EventTemplate, ...] = (
     EventTemplate(
         "business_exit",
         "Business exit",
-        '("sells business" OR "sold the business" OR "sold his stake" OR '
-        '"sold her stake" OR "completes sale of" OR "agrees sale of" OR '
+        '("sold his stake" OR "sold her stake" OR "sells his stake" OR '
+        '"sells her stake" OR "the founder sold" OR "owner sold" OR '
+        '"sells business" OR "sold the business" OR "completes sale of" OR '
         '"exits business" OR "sells majority stake")',
         95,
         "A completed disposal turns paper wealth into cash. The strongest single "
@@ -59,7 +60,8 @@ EVENT_TEMPLATES: tuple[EventTemplate, ...] = (
         "acquisition",
         "Acquired",
         '("acquired by" OR "snapped up by" OR "takeover of" OR "buys stake in" OR '
-        '"agrees to acquire" OR "acquires majority")',
+        '"agrees to acquire" OR "acquires majority") '
+        '(founder OR owner OR "family business" OR director OR chairman)',
         85,
         "An acquisition usually pays out the founders and any minority holders.",
     ),
@@ -67,7 +69,8 @@ EVENT_TEMPLATES: tuple[EventTemplate, ...] = (
         "management_buyout",
         "Management buyout",
         '("management buyout" OR "MBO" OR "employee ownership trust" OR '
-        '"management buy-in")',
+        '"management buy-in") (led by OR founder OR "managing director" OR '
+        '"chief executive" OR owner)',
         80,
         "A buyout pays the exiting owner and creates newly-wealthy managers.",
     ),
@@ -75,7 +78,8 @@ EVENT_TEMPLATES: tuple[EventTemplate, ...] = (
         "venture_funding",
         "Venture funding",
         '(raises OR secures OR closes) ("Series A" OR "Series B" OR "Series C" OR '
-        '"funding round" OR "investment round" OR "growth round")',
+        '"funding round" OR "investment round" OR "growth round") '
+        '(founder OR "co-founder" OR "chief executive")',
         65,
         "A priced round values the founder's stake, but it is paper wealth — the "
         "relationship is worth building before the exit, not after.",
@@ -83,8 +87,9 @@ EVENT_TEMPLATES: tuple[EventTemplate, ...] = (
     EventTemplate(
         "private_equity",
         "Private equity",
-        '("private equity" OR "growth capital" OR "sovereign wealth fund") '
-        '(backs OR invests OR acquires OR "takes stake")',
+        '("private equity" OR "growth capital" OR "buyout house") '
+        '(backs OR invests OR acquires OR "takes stake") '
+        '(founder OR owner OR "management team" OR "family shareholders")',
         80,
         "A sponsor on the register means an exit is coming, usually inside five years.",
     ),
@@ -92,7 +97,8 @@ EVENT_TEMPLATES: tuple[EventTemplate, ...] = (
         "ipo",
         "IPO or flotation",
         '(IPO OR "initial public offering" OR "floats on" OR "AIM listing" OR '
-        '"stock market listing" OR "lists shares")',
+        '"stock market listing" OR "lists shares") '
+        '(founder OR "will retain" OR "stake worth" OR chairman)',
         85,
         "A listing creates tradeable, valued holdings and a known liquidity date.",
     ),

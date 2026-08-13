@@ -22,13 +22,14 @@ build step, no API key needed to start.
 
 ---
 
-## The six pages
+## The seven pages
 
 | Page | What it is for |
 | --- | --- |
 | **Overview** | Totals, addressable assets by market and country, wealth bands, a map |
 | **Prospect list** | One sortable, filterable table of everyone found. Click a row for the full record |
 | **Find prospects** | Choose where to look and how hard, see the cost, press go |
+| **Find the owner** | Real transactions the press left unnamed, and a one-click register lookup to name them |
 | **Screened out** | Who the app refused, and why — the rules are inspectable, not hidden |
 | **Weekly research document** | The Monday write-up: who is new, why, what each figure rests on |
 | **How it works** | Every model assumption, the market list, lawful use, Companies House setup |
@@ -150,8 +151,12 @@ off, because processed articles are never reprocessed.
    accepted when the market or country name corroborates them, so an article
    about bathroom fittings doesn't become a Somerset prospect.
 
-3. **Extracts** the transaction value in ~25 currencies, the named individual and
-   their role, and the company. The extractor prefers finding nothing to
+3. **Extracts** the transaction value in ~25 currencies, **every** named
+   individual and their role, and the company. All of them, not just the first:
+   an article about two co-founders selling up describes two people worth
+   talking to. Where several are named for one transaction the assumed founder
+   stake is split between them, so the same £60m is not reported twice — a
+   *filed* PSC band is never split, because that is their actual shareholding. The extractor prefers finding nothing to
    guessing: "acquired by German rival Schmidt AG" yields no person, and
    "US Firm Sold for £40m" yields no person, because a false name here becomes a
    wrong claim about a real individual.
@@ -175,7 +180,7 @@ you what share reached a named individual. So:
 | Situation | What the app does |
 | --- | --- |
 | Transaction value reported, individual named | Estimates, and states the arithmetic: *"£210m reported value, of which the named individual is assumed to hold 55% (range 35–75%), less 22% CGT, of which 75% assumed retained"* |
-| Value reported, **no individual named** | **No figure.** Recorded as a company-level lead with the reason. Inventing a name would be worse than useless |
+| Value reported, **no individual named** | **No figure, and no invented name.** The transaction goes on the *Find the owner* worklist instead of being discarded — with Companies House connected, one click turns the company into its filed owners, with shareholding bands stated rather than assumed |
 | Individual named, **no value reported** | **No figure**, with the reason. A lead for manual research |
 | Property purchase, retirement, family office | **No figure** — these indicate wealth but cannot size it. Recorded as corroboration |
 | Funding round | Estimates, but flags it as **paper wealth**: only 5% counted as investable, because unexited founder equity can't be sold |
@@ -306,7 +311,7 @@ wealthscan/
 scripts/
   run_research.py           CLI for a scheduler
   seed_demo.py              52 fictional prospects
-tests_py/test_research.py   70 tests
+tests_py/test_research.py   75 tests
 ```
 
 Run the tests with `python -m unittest discover -s tests_py -v`.

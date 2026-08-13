@@ -31,7 +31,12 @@ from .queries import (
     build_search_matrix,
 )
 from .scoring import cohort_for, estimate_from_event, score_confidence
-from .sources import Fetcher, fetch_feed, verify_with_companies_house
+from .sources import (
+    Fetcher,
+    fetch_feed,
+    find_company_principals,
+    verify_with_companies_house,
+)
 
 #: ``(message, fraction_complete)``
 ProgressCallback = Callable[[str, float], None]
@@ -204,13 +209,15 @@ def run_research(
                     )
 
             if outcome["kind"] == "new":
-                result.new_prospects += 1
+                # One article can name two co-founders. Both are prospects.
+                result.new_prospects += 1 + int(outcome.get("extra_new", 0) or 0)
+                result.updated_prospects += int(outcome.get("extra_updated", 0) or 0)
                 result.log.append(
                     f"New · {outcome['name']} · {event.market_name} · {event.event_label}"
                     + (f" · {event.publisher}" if event.publisher else "")
                 )
             elif outcome["kind"] == "updated":
-                result.updated_prospects += 1
+                result.updated_prospects += 1 + int(outcome.get("extra_updated", 0) or 0)
             elif outcome["kind"] == "company_lead":
                 result.company_leads += 1
 
@@ -281,16 +288,56 @@ def _company_status(event: ExtractedEvent, ch_match) -> str | None:
 def _store_event(
     event: ExtractedEvent, *, fetcher: Fetcher, verify_ch: bool
 ) -> dict[str, object]:
-    """Persist one event against a prospect, creating the record if needed."""
-    ch_warning: str | None = None
-    ch_match = None
+    """Persist one event against every individual it names.
 
+    Every named person becomes a prospect, not just the first. An article about
+    two co-founders selling their business describes two people worth talking to,
+    and keeping only whichever the sentence happened to mention first threw the
+    other one away.
+    """
     if not event.people:
-        # No individual named. Still worth recording as a company-level lead, but
-        # it is not a prospect — inventing a name would be worse than useless.
+        # No individual named. Inventing one would be worse than useless — but so
+        # is discarding a real transaction, which is what used to happen. It goes
+        # on the worklist, where the register can be asked whose it was.
+        with db.connect() as conn:
+            db.record_company_lead(conn, {
+                "company": event.company,
+                "market_key": event.market_key,
+                "market_name": event.market_name,
+                "country": event.country,
+                "locality": event.locality,
+                "event_key": event.event_key,
+                "event_label": event.event_label,
+                "amount_gbp": event.amount_gbp,
+                "title": event.title,
+                "url": event.url,
+                "publisher": event.publisher,
+                "published_at": event.published_at.isoformat() if event.published_at else None,
+            })
         return {"kind": "company_lead", "name": event.company or event.title, "ch_warning": None}
 
-    person = event.people[0]
+    outcomes = [
+        _store_person(event, person, fetcher=fetcher, verify_ch=verify_ch,
+                      co_principals=len(event.people))
+        for person in event.people
+    ]
+    created = [o for o in outcomes if o["kind"] == "new"]
+    return {
+        "kind": "new" if created else "updated",
+        "name": ", ".join(str(o["name"]) for o in (created or outcomes)),
+        "extra_new": max(0, len(created) - 1),
+        "extra_updated": len(outcomes) - len(created) - (0 if created else 1),
+        "ch_warning": next((o["ch_warning"] for o in outcomes if o["ch_warning"]), None),
+    }
+
+
+def _store_person(
+    event: ExtractedEvent, person, *, fetcher: Fetcher, verify_ch: bool,
+    co_principals: int = 1,
+) -> dict[str, object]:
+    """Persist one event against one named individual."""
+    ch_warning: str | None = None
+    ch_match = None
 
     # Companies House is the *UK* register. Running a Dubai or Texas company
     # through it would either find nothing or, worse, find a same-named British
@@ -322,6 +369,7 @@ def _store_event(
         has_named_person=True,
         # A filed PSC band replaces the assumed stake outright.
         known_stake_band=ch_match.ownership_band if ch_match else None,
+        co_principals=co_principals,
     )
 
     slug = db.slugify(f"{person.name}-{event.market_key}")
@@ -442,6 +490,189 @@ def _store_event(
         "name": person.name,
         "ch_warning": ch_warning,
     }
+
+
+def resolve_lead_with_register(lead_id: int, *, fetcher: Fetcher | None = None) -> dict:
+    """Ask Companies House who owns a company the press did not name.
+
+    This is the highest-yield thing the app does for people specifically. A
+    reported £30m disposal with no individual attached is not a dead end — it is a
+    company number away from a filed list of the people who own it, with their
+    shareholding bands stated rather than assumed. The press is the weaker source
+    here and the register is the stronger one.
+
+    Prospects created this way are graded on the filing, not on the article.
+    """
+    client = fetcher or Fetcher()
+    with db.connect() as conn:
+        lead = conn.execute(
+            "SELECT * FROM company_leads WHERE id = ?", (lead_id,)
+        ).fetchone()
+    if lead is None:
+        return {"created": 0, "note": "Lead not found."}
+
+    if (lead["country"] or "") != "United Kingdom":
+        note = (
+            f"{lead['country'] or 'This market'} is outside the Companies House "
+            f"register, so ownership cannot be resolved automatically."
+        )
+        with db.connect() as conn:
+            db.resolve_company_lead(conn, lead_id, note=note, people_found=0)
+        return {"created": 0, "note": note}
+
+    if not lead["company"]:
+        note = "The source names no company, so there is nothing to look up."
+        with db.connect() as conn:
+            db.resolve_company_lead(conn, lead_id, note=note, people_found=0)
+        return {"created": 0, "note": note}
+
+    principals, warning, company = find_company_principals(
+        client, company_name=lead["company"]
+    )
+    if not principals:
+        note = warning or "No filed principals found."
+        with db.connect() as conn:
+            db.resolve_company_lead(conn, lead_id, note=note, people_found=0)
+        return {"created": 0, "note": note}
+
+    # People who own the company are prospects. People who merely run it are
+    # recorded too, but their stake is not assumed from a shareholder model —
+    # a salaried director of a sold business may receive nothing at all.
+    owners = [p for p in principals if p.kind == "psc"]
+    created = 0
+    names: list[str] = []
+
+    for principal in principals:
+        estimate = estimate_from_event(
+            event_key=lead["event_key"] or "acquisition",
+            amount_gbp=lead["amount_gbp"] if principal.kind == "psc" else None,
+            text=lead["title"] or "",
+            has_named_person=True,
+            known_stake_band=principal.ownership_band,
+            co_principals=max(1, len(owners)) if not principal.ownership_band else 1,
+        )
+        if principal.kind == "officer" and not principal.ownership_band:
+            estimate.not_estimated_reason = (
+                f"{principal.name} is a filed officer of {company.company_name if company else lead['company']} "
+                f"but does not appear on the PSC register, so they hold under 25% or "
+                f"hold through another entity. Running a shareholder model over a "
+                f"salaried director would invent a figure — a director of a sold "
+                f"business may receive nothing at all."
+            )
+
+        confidence = score_confidence(
+            publisher="Companies House",
+            has_named_person=True,
+            amount_disclosed=lead["amount_gbp"] is not None,
+            source_count=2,  # the article and the filing
+            event_weight=EVENT_BY_KEY[lead["event_key"]].weight
+            if lead["event_key"] in EVENT_BY_KEY else 70,
+            stake_verified=bool(principal.ownership_band),
+            companies_house_verified=True,
+            estimate_is_none=estimate.investable_mid_gbp is None,
+            location_from_text=True,
+        )
+
+        slug = db.slugify(f"{principal.name}-{lead['market_key']}")
+        record = {
+            "slug": slug,
+            "full_name": principal.name,
+            "job_title": principal.role,
+            "company": company.company_name if company else lead["company"],
+            "market_key": lead["market_key"],
+            "market_name": lead["market_name"],
+            "market_group": (MARKET_BY_KEY[lead["market_key"]].group
+                             if lead["market_key"] in MARKET_BY_KEY else None),
+            "country": lead["country"],
+            "market_source": "text",
+            "locality": lead["locality"],
+            "address": company.registered_office if company else None,
+            "gross_low_gbp": estimate.gross_low_gbp,
+            "gross_mid_gbp": estimate.gross_mid_gbp,
+            "gross_high_gbp": estimate.gross_high_gbp,
+            "investable_low_gbp": estimate.investable_low_gbp,
+            "investable_mid_gbp": estimate.investable_mid_gbp,
+            "investable_high_gbp": estimate.investable_high_gbp,
+            "wealth_band": estimate.band,
+            "cohort": cohort_for(estimate.investable_mid_gbp, estimate.gross_mid_gbp,
+                                 estimate.annual_income_gbp),
+            "annual_income_gbp": estimate.annual_income_gbp,
+            "annual_income_basis": estimate.annual_income_basis,
+            "estimate_method": estimate.method,
+            "estimate_caveats": json.dumps(estimate.caveats),
+            "not_estimated_reason": estimate.not_estimated_reason,
+            "confidence": confidence.score,
+            "confidence_band": confidence.band,
+            "confidence_detail": json.dumps([
+                {"label": d.label, "score": d.score, "weight": d.weight, "why": d.explanation}
+                for d in confidence.dimensions
+            ]),
+            "next_action": confidence.next_action,
+            "rationale": (
+                f"{principal.name} was identified from the Companies House register, not "
+                f"from the press. {lead['publisher'] or 'A source'} reported "
+                f"“{lead['title']}” without naming anyone; the register lists them as "
+                f"{principal.role.lower()} of {company.company_name if company else lead['company']}"
+                + (f", holding {principal.ownership_band}." if principal.ownership_band
+                   else ", with no shareholding filed.")
+                + " The filing is the stronger source of the two."
+            ),
+            "primary_event": lead["event_label"],
+            "company_status": "Private",
+            "company_number": company.company_number if company else None,
+            "latest_newsflow": lead["title"],
+            "evidence_grade": "High",
+            "evidence_basis": (
+                "Identified from a Companies House filing rather than from press "
+                "reporting. The person and their role are stated, not inferred."
+            ),
+            "wealth_source": WEALTH_SOURCE.get(lead["event_key"] or "", "Private company ownership"),
+            "ch_company_number": company.company_number if company else None,
+            "ch_company_name": company.company_name if company else None,
+            "ch_officer_name": principal.name,
+            "ch_ownership_band": principal.ownership_band,
+            "ch_registered_office": company.registered_office if company else None,
+            "ch_profile_url": company.profile_url if company else None,
+            "ch_verified_at": db.now_iso(),
+            "first_seen": db.now_iso(),
+            "last_updated": db.now_iso(),
+            "first_seen_week": db.iso_week(),
+        }
+
+        with db.connect() as conn:
+            prospect_id, was_created = db.upsert_prospect(conn, record)
+            db.add_source(conn, prospect_id, {
+                "url": lead["url"], "title": lead["title"],
+                "publisher": lead["publisher"], "published_at": lead["published_at"],
+                "event_key": lead["event_key"], "event_label": lead["event_label"],
+                "amount_gbp": lead["amount_gbp"],
+                "excerpt": "", "rationale": "The transaction that prompted the register lookup.",
+            })
+            if company:
+                db.add_source(conn, prospect_id, {
+                    "url": company.profile_url,
+                    "title": f"{company.company_name} — Companies House filings",
+                    "publisher": "Companies House", "published_at": None,
+                    "event_key": None, "event_label": "Statutory filing",
+                    "amount_gbp": None, "excerpt": "",
+                    "rationale": f"Filed record naming {principal.name} as {principal.role.lower()}.",
+                })
+            if was_created:
+                db.add_event(conn, prospect_id, "created",
+                             f"Identified from the Companies House register after "
+                             f"{lead['publisher'] or 'a source'} reported the transaction "
+                             f"without naming anyone.",
+                             company.profile_url if company else None)
+                created += 1
+                names.append(principal.name)
+
+    note = (
+        f"{len(principals)} filed principal(s) found; {created} new prospect(s) created"
+        + (f": {', '.join(names)}." if names else ".")
+    )
+    with db.connect() as conn:
+        db.resolve_company_lead(conn, lead_id, note=note, people_found=len(principals))
+    return {"created": created, "note": note, "names": names}
 
 
 def _build_rationale(event: ExtractedEvent, estimate) -> str:

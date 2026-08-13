@@ -322,6 +322,132 @@ def _pick_company(items: list[dict], company_name: str) -> dict | None:
     return best if score(best)[0] >= 1 else None
 
 
+@dataclass
+class Principal:
+    """A named individual attached to a company by a statutory filing."""
+
+    name: str
+    role: str
+    #: "psc" (owns it) or "officer" (runs it). Different claims, kept apart.
+    kind: str
+    ownership_band: str | None = None
+    appointed_on: str | None = None
+    nationality: str | None = None
+
+
+def find_company_principals(
+    fetcher: Fetcher, *, company_name: str
+) -> tuple[list[Principal], str | None, CompaniesHouseMatch | None]:
+    """Who owns and runs a company, from the register.
+
+    This is the step that turns "a Devon robotics firm sold for £30m" — a real
+    transaction with no name attached, which the app would otherwise discard —
+    into named individuals with filed shareholdings. The register knows who they
+    are even when the press does not, and it is the *stronger* source of the two.
+
+    Returns ``(principals, warning, company)``.
+    """
+    if not COMPANIES_HOUSE_API_KEY:
+        return [], "No Companies House key configured.", None
+
+    match, warning = verify_with_companies_house(
+        fetcher, company_name=company_name, person_name=None
+    )
+    if match is None:
+        return [], warning, None
+
+    principals: list[Principal] = []
+    number = match.company_number
+
+    try:
+        psc = fetcher.get(
+            f"{COMPANIES_HOUSE_BASE}/company/{number}/persons-with-significant-control",
+            params={"items_per_page": 50}, auth=_auth(),
+            headers={"Accept": "application/json"},
+        )
+        if psc is not None and psc.status_code == 200:
+            for entry in psc.json().get("items") or []:
+                if entry.get("ceased_on"):
+                    continue
+                # Corporate PSCs are companies, not people. A holding company is
+                # not a prospect, and following it would need another lookup.
+                if entry.get("kind", "").startswith("corporate"):
+                    continue
+                natures = " ".join(entry.get("natures_of_control") or [])
+                principals.append(Principal(
+                    name=_titlecase_filed_name(entry.get("name") or ""),
+                    role="Person with significant control",
+                    kind="psc",
+                    ownership_band=next(
+                        (label for pattern, label in _OWNERSHIP_BANDS
+                         if re.search(pattern, natures)),
+                        None,
+                    ),
+                    appointed_on=entry.get("notified_on"),
+                    nationality=(entry.get("nationality") or None),
+                ))
+
+        officers = fetcher.get(
+            f"{COMPANIES_HOUSE_BASE}/company/{number}/officers",
+            params={"items_per_page": 50}, auth=_auth(),
+            headers={"Accept": "application/json"},
+        )
+        if officers is not None and officers.status_code == 200:
+            known = {p.name.lower() for p in principals}
+            for entry in officers.json().get("items") or []:
+                if entry.get("resigned_on"):
+                    continue
+                if (entry.get("officer_role") or "").startswith("corporate"):
+                    continue
+                name = _titlecase_filed_name(entry.get("name") or "")
+                if not name or name.lower() in known:
+                    continue
+                principals.append(Principal(
+                    name=name,
+                    role=(entry.get("officer_role") or "director").replace("-", " ").title(),
+                    kind="officer",
+                    appointed_on=entry.get("appointed_on"),
+                    nationality=(entry.get("nationality") or None),
+                ))
+    except requests.RequestException as error:
+        return principals, f"Companies House unreachable: {error}", match
+    except (ValueError, KeyError) as error:
+        return principals, f"Unexpected Companies House response: {error}", match
+
+    if not principals:
+        return [], (
+            f"{match.company_name} is on the register, but no active person with "
+            f"significant control or officer is filed against it."
+        ), match
+
+    return principals, None, match
+
+
+def _titlecase_filed_name(filed: str) -> str:
+    """"SMITH, John Andrew" → "John Andrew Smith".
+
+    Companies House files names surname-first in block capitals. Left as filed
+    they sort wrongly, read badly, and never match the press spelling of the same
+    person.
+    """
+    name = filed.strip()
+    if not name:
+        return ""
+    if "," in name:
+        surname, _, forenames = name.partition(",")
+        name = f"{forenames.strip()} {surname.strip()}"
+    parts = []
+    for word in name.split():
+        if word.isupper() or word.islower():
+            # Preserve the internal capital in O'Brien and Smith-Jones.
+            word = "-".join(
+                "'".join(bit.capitalize() for bit in chunk.split("'"))
+                for chunk in word.split("-")
+            )
+        parts.append(word)
+    return " ".join(parts)
+
+
 def verify_with_companies_house(
     fetcher: Fetcher, *, company_name: str | None, person_name: str | None
 ) -> tuple[CompaniesHouseMatch | None, str | None]:
