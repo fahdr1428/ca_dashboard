@@ -156,6 +156,15 @@ def estimate_from_event(
 
     # --- Realised: money has actually changed hands ------------------------
     if event_key in REALISED_EVENTS:
+        # The largest figure in a headline is usually the consideration, but not
+        # always: "sells minority stake at a $1.4bn valuation" prices the whole
+        # company, not the proceeds, and treating the two alike overstates the
+        # position several times over. The arithmetic cannot tell them apart from
+        # a 200-character snippet, so the record says so instead of pretending.
+        priced_off_valuation = bool(
+            re.search(r"\b(valuation|valued at|values the (?:company|business|group))\b",
+                      text, re.I)
+        )
         filed = parse_ownership_band(known_stake_band)
         if filed:
             lows, mids, highs = filed
@@ -208,7 +217,12 @@ def estimate_from_event(
             ) + [
                 "Reported transaction values often include debt, deferred "
                 "consideration or earn-outs that never reach the seller.",
-            ],
+            ] + ([
+                "The source describes a **valuation**, which is the price of the whole "
+                "company rather than the money the seller received. If only part of the "
+                "business changed hands, this figure is too high — possibly by a large "
+                "multiple. Find the consideration before using it.",
+            ] if priced_off_valuation else []),
             is_realised=True,
         )
 
@@ -313,12 +327,29 @@ def estimate_from_event(
 # Confidence
 # ---------------------------------------------------------------------------
 
-#: Publishers whose business reporting is reliable enough to lean on.
+#: Publishers whose business reporting is reliable enough to lean on. Not a
+#: judgement about journalism in general — only about whether a deal figure
+#: attributed to a named person can be leaned on without a second source.
 TRUSTED_PUBLISHERS = (
+    # United Kingdom
     "bbc", "financial times", "ft.com", "reuters", "bloomberg", "the times",
     "sunday times", "telegraph", "guardian", "insider media", "businesslive",
     "business live", "uktn", "sky news", "city a.m", "the business magazine",
-    "bdaily", "development finance", "growth business",
+    "bdaily", "development finance", "growth business", "sifted",
+    # United States
+    "wall street journal", "wsj", "cnbc", "forbes", "fortune", "axios",
+    "techcrunch", "business insider", "barron", "pitchbook", "the information",
+    "associated press", "ap news", "new york times",
+    # Middle East
+    "arabian business", "zawya", "gulf business", "the national", "arab news",
+    "khaleej times", "gulf news", "meed", "wamda", "globes", "calcalist",
+    # Europe and Asia-Pacific
+    "handelsblatt", "les echos", "il sole", "expansión", "nikkei",
+    "south china morning post", "scmp", "straits times", "the australian",
+    "australian financial review", "economic times", "livemint", "mint",
+    "business standard", "tech.eu", "eu-startups",
+    # Sector press
+    "private equity wire", "family capital", "citywire", "ignites", "with intelligence",
 )
 
 
@@ -359,6 +390,7 @@ def score_confidence(
     stake_verified: bool = False,
     companies_house_verified: bool = False,
     estimate_is_none: bool = False,
+    location_from_text: bool = True,
 ) -> Confidence:
     """How much should an advisor trust this record?
 
@@ -372,7 +404,7 @@ def score_confidence(
     dims.append(ConfidenceDimension(
         "source", "Source reliability",
         78 if trusted else 45,
-        0.22,
+        0.20,
         f"Reported by {publisher or 'an unidentified publisher'}."
         + ("" if trusted else " Not a publisher on the known-reliable list, so the claim needs corroborating."),
     ))
@@ -380,7 +412,7 @@ def score_confidence(
     dims.append(ConfidenceDimension(
         "identity", "Individual identified",
         72 if has_named_person else 18,
-        0.24,
+        0.22,
         "An individual is named in the source."
         if has_named_person
         else "No individual is named — this is a company-level lead until someone is identified.",
@@ -388,7 +420,7 @@ def score_confidence(
 
     if companies_house_verified:
         dims[-1] = ConfidenceDimension(
-            "identity", "Individual identified", 92, 0.24,
+            "identity", "Individual identified", 92, 0.22,
             "Matched to a Companies House officer record, so the person behind the "
             "appointments is confirmed.",
         )
@@ -396,7 +428,7 @@ def score_confidence(
     dims.append(ConfidenceDimension(
         "ownership", "Ownership evidence",
         90 if stake_verified else 25,
-        0.24,
+        0.22,
         "Shareholding evidenced by the PSC register."
         if stake_verified
         else "The individual's shareholding is assumed, not evidenced. This is the "
@@ -406,17 +438,32 @@ def score_confidence(
     dims.append(ConfidenceDimension(
         "amount", "Figure disclosed",
         70 if amount_disclosed else 20,
-        0.14,
+        0.13,
         "A monetary value is stated in the source."
         if amount_disclosed
         else "No monetary value was reported, so no figure could be derived.",
+    ))
+
+    # Where the location came from. An article surfaced by the Dubai search that
+    # never says "Dubai" is still worth keeping — discarding those is what made
+    # the first version of this app return almost nothing — but the location is
+    # then an inference, and pretending otherwise would be the same class of
+    # error as presenting an estimate as a fact.
+    dims.append(ConfidenceDimension(
+        "location", "Location evidence",
+        80 if location_from_text else 35,
+        0.10,
+        "The source names the place, so the market is evidenced."
+        if location_from_text
+        else "The source does not name a place. The market is inferred from the search "
+             "that found the article — check it before acting on the record.",
     ))
 
     corroboration = min(95, 30 + (source_count - 1) * 28)
     dims.append(ConfidenceDimension(
         "corroboration", "Corroboration",
         corroboration,
-        0.16,
+        0.13,
         f"{source_count} independent source{'' if source_count == 1 else 's'} on file."
         + (" Single-source records are the most common cause of false positives."
            if source_count == 1 else ""),
@@ -440,6 +487,7 @@ def score_confidence(
         "identity": "Identify the owner — search the company on Companies House and read the officers list.",
         "ownership": "Pull the PSC register entry to replace the assumed stake with a filed band.",
         "amount": "Look for a reported transaction value, or the filed accounts, to put a figure on it.",
+        "location": "Confirm where they are actually based — the market was inferred from the search, not stated in the source.",
         "corroboration": "Find a second independent source before making contact.",
     }
 

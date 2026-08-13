@@ -12,8 +12,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 APP_NAME = "Lead Intelligence"
-APP_SUBTITLE = "Private wealth research · South England"
-MODEL_VERSION = "2.0.0"
+APP_SUBTITLE = "Private wealth prospecting · UK · US · Middle East"
+MODEL_VERSION = "3.0.0"
 
 # --- Storage ---------------------------------------------------------------
 # SQLite, so there is no database server to install or configure. Override with
@@ -32,8 +32,10 @@ USER_AGENT = os.environ.get(
     "WealthAdvisorLeadIntelligence/2.0 (research; +contact: set WEALTHSCAN_CONTACT)",
 )
 REQUEST_TIMEOUT_SECONDS = 20
-# Google's RSS endpoint tolerates a steady rate; 0.5s keeps a full 182-query
-# sweep to roughly two minutes while staying well short of hammering anyone.
+# Google's RSS endpoint tolerates a steady rate. 0.5s is the floor at which a
+# thousand-query deep sweep still finishes inside about fifteen minutes without
+# looking like an attack; the whole design assumes patience rather than volume
+# per second.
 REQUEST_DELAY_SECONDS = float(os.environ.get("WEALTHSCAN_DELAY", "0.5"))
 MAX_RETRIES = 3
 

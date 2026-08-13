@@ -204,84 +204,238 @@ class CompaniesHouseMatch:
     officer_name: str | None
     ownership_band: str | None
     profile_url: str
+    #: The registered office, formatted as one line. A real, verifiable address —
+    #: not the individual's home, and it must never be presented as one.
+    registered_office: str | None = None
+    company_status: str | None = None
+    incorporated_on: str | None = None
+    #: Where the person appears in the filings: 'psc', 'officer', or None.
+    matched_via: str | None = None
 
 
 def companies_house_available() -> bool:
     return bool(COMPANIES_HOUSE_API_KEY)
 
 
+def _auth() -> tuple[str, str]:
+    """HTTP Basic with the key as the username and an empty password.
+
+    This is the whole of Companies House authentication, and the most common
+    reason a key appears not to work is sending it as a Bearer token instead.
+    """
+    return (COMPANIES_HOUSE_API_KEY, "")
+
+
+def _format_address(address: dict | None) -> str | None:
+    if not address:
+        return None
+    parts = [
+        address.get("premises"),
+        address.get("address_line_1"),
+        address.get("address_line_2"),
+        address.get("locality"),
+        address.get("region"),
+        address.get("postal_code"),
+        address.get("country"),
+    ]
+    joined = ", ".join(str(p).strip() for p in parts if p and str(p).strip())
+    return joined or None
+
+
+def companies_house_status(fetcher: Fetcher | None = None) -> tuple[bool, str]:
+    """Is the key live? Returns ``(ok, human explanation)``.
+
+    Worth doing as its own check: "no key", "wrong kind of key" and "the register
+    is down" need three different actions, and a single "verification off"
+    message hides which one you are looking at.
+    """
+    if not COMPANIES_HOUSE_API_KEY:
+        return False, (
+            "No API key set. Companies House verification is a bonus, not a "
+            "requirement — set COMPANIES_HOUSE_API_KEY to switch it on."
+        )
+
+    client = fetcher or Fetcher()
+    try:
+        response = client.get(
+            f"{COMPANIES_HOUSE_BASE}/search/companies",
+            params={"q": "test", "items_per_page": 1},
+            auth=_auth(),
+            headers={"Accept": "application/json"},
+        )
+    except requests.RequestException as error:
+        return False, f"Could not reach Companies House: {type(error).__name__} — {error}"
+
+    if response is None:
+        return False, "Companies House did not respond."
+    if response.status_code in (401, 403):
+        return False, (
+            f"Companies House rejected the key (HTTP {response.status_code}). It must be "
+            "a REST API key from a *live* application, sent as the HTTP Basic username. "
+            "A streaming key or a test-sandbox key will fail exactly like this."
+        )
+    if response.status_code == 429:
+        return False, "Rate limited (HTTP 429). The key works; the register is throttling us."
+    if response.status_code != 200:
+        return False, f"Companies House returned HTTP {response.status_code}."
+    return True, "Connected. Shareholdings will be checked against the PSC register."
+
+
+def _company_profile(fetcher: Fetcher, number: str) -> dict:
+    """Registered office and status for a company number, or an empty dict."""
+    try:
+        response = fetcher.get(
+            f"{COMPANIES_HOUSE_BASE}/company/{number}",
+            auth=_auth(),
+            headers={"Accept": "application/json"},
+        )
+    except requests.RequestException:
+        return {}
+    if response is None or response.status_code != 200:
+        return {}
+    try:
+        return response.json() or {}
+    except ValueError:
+        return {}
+
+
+def _pick_company(items: list[dict], company_name: str) -> dict | None:
+    """Choose the closest name match, preferring companies that still trade.
+
+    The register's own relevance ranking will happily return a dissolved
+    namesake, and attaching a wrong company number to a person is a factual
+    error about a real individual.
+    """
+    if not items:
+        return None
+    wanted = {w for w in re.findall(r"[a-z0-9]+", company_name.lower()) if len(w) > 2}
+
+    def score(item: dict) -> tuple[int, int]:
+        title = (item.get("title") or "").lower()
+        words = {w for w in re.findall(r"[a-z0-9]+", title) if len(w) > 2}
+        overlap = len(wanted & words)
+        active = 1 if (item.get("company_status") == "active") else 0
+        return (overlap, active)
+
+    best = max(items, key=score)
+    # No meaningful word in common means this is a different company.
+    return best if score(best)[0] >= 1 else None
+
+
 def verify_with_companies_house(
-    fetcher: Fetcher, *, company_name: str, person_name: str | None
+    fetcher: Fetcher, *, company_name: str | None, person_name: str | None
 ) -> tuple[CompaniesHouseMatch | None, str | None]:
     """Look up a company and, if possible, confirm the person's shareholding.
 
     Entirely optional. When no key is configured this returns ``(None, reason)``
     and the prospect simply keeps its assumed stake, clearly labelled as assumed.
+
+    Three things are attempted, in descending order of value:
+
+      1. the PSC register, which turns an assumed stake into a filed band;
+      2. the officers list, which confirms the person is really attached to the
+         company even when they hold under 25%;
+      3. the registered office, which gives a real address to work from.
     """
     if not COMPANIES_HOUSE_API_KEY:
         return None, "No Companies House key configured — shareholding remains an assumption."
+    if not company_name:
+        return None, "No company name was extracted, so there is nothing to look up."
 
-    auth = (COMPANIES_HOUSE_API_KEY, "")
     try:
         search = fetcher.get(
             f"{COMPANIES_HOUSE_BASE}/search/companies",
-            params={"q": company_name, "items_per_page": 5},
-            auth=auth,
+            params={"q": company_name, "items_per_page": 10},
+            auth=_auth(),
             headers={"Accept": "application/json"},
         )
-        if search is None or search.status_code == 401 or search.status_code == 403:
-            return None, "Companies House rejected the key (401/403). Check it is a REST API key."
+        if search is None:
+            return None, "Companies House did not respond."
+        if search.status_code in (401, 403):
+            return None, (
+                f"Companies House rejected the key (HTTP {search.status_code}). It must be a "
+                "REST API key from a live application, sent as the HTTP Basic username."
+            )
         if search.status_code != 200:
             return None, f"Companies House search returned HTTP {search.status_code}."
 
-        items = search.json().get("items") or []
-        if not items:
+        best = _pick_company(search.json().get("items") or [], company_name)
+        if best is None:
             return None, f"No company on the register matched “{company_name}”."
 
-        best = items[0]
-        number = best.get("company_number")
-        profile_url = (
-            "https://find-and-update.company-information.service.gov.uk/company/" + str(number)
-        )
+        number = str(best.get("company_number"))
+        profile = _company_profile(fetcher, number)
         match = CompaniesHouseMatch(
-            company_number=str(number),
-            company_name=best.get("title") or company_name,
+            company_number=number,
+            company_name=profile.get("company_name") or best.get("title") or company_name,
             officer_name=None,
             ownership_band=None,
-            profile_url=profile_url,
+            profile_url=(
+                "https://find-and-update.company-information.service.gov.uk/company/" + number
+            ),
+            registered_office=_format_address(
+                profile.get("registered_office_address") or best.get("address")
+            ),
+            company_status=profile.get("company_status") or best.get("company_status"),
+            incorporated_on=profile.get("date_of_creation"),
         )
 
         if not person_name:
             return match, None
 
+        surname = person_name.split()[-1].lower()
+
         psc = fetcher.get(
             f"{COMPANIES_HOUSE_BASE}/company/{number}/persons-with-significant-control",
             params={"items_per_page": 50},
-            auth=auth,
+            auth=_auth(),
             headers={"Accept": "application/json"},
         )
-        if psc is None or psc.status_code != 200:
-            return match, "Company found, but the PSC register could not be read."
+        # 404 is the register's way of saying "this company has filed no PSC
+        # statements", which is information, not an error.
+        if psc is not None and psc.status_code == 200:
+            for entry in psc.json().get("items") or []:
+                if entry.get("ceased_on"):
+                    continue
+                name = (entry.get("name") or "").lower()
+                if surname and surname in name:
+                    natures = " ".join(entry.get("natures_of_control") or [])
+                    match.officer_name = entry.get("name")
+                    match.ownership_band = next(
+                        (label for pattern, label in _OWNERSHIP_BANDS
+                         if re.search(pattern, natures)),
+                        None,
+                    )
+                    match.matched_via = "psc"
+                    return match, None
 
-        surname = person_name.split()[-1].lower()
-        for entry in psc.json().get("items") or []:
-            if entry.get("ceased_on"):
-                continue
-            name = (entry.get("name") or "").lower()
-            if surname and surname in name:
-                natures = " ".join(entry.get("natures_of_control") or [])
-                band = next(
-                    (label for pattern, label in _OWNERSHIP_BANDS if re.search(pattern, natures)),
-                    None,
-                )
-                match.officer_name = entry.get("name")
-                match.ownership_band = band
-                return match, None
+        # Not a PSC. They may still be an officer, which confirms the connection
+        # without evidencing a shareholding — a materially weaker claim, recorded
+        # as such rather than as verification of the stake.
+        officers = fetcher.get(
+            f"{COMPANIES_HOUSE_BASE}/company/{number}/officers",
+            params={"items_per_page": 50},
+            auth=_auth(),
+            headers={"Accept": "application/json"},
+        )
+        if officers is not None and officers.status_code == 200:
+            for entry in officers.json().get("items") or []:
+                if entry.get("resigned_on"):
+                    continue
+                name = (entry.get("name") or "").lower()
+                if surname and surname in name:
+                    match.officer_name = entry.get("name")
+                    match.matched_via = "officer"
+                    return match, (
+                        f"“{person_name}” is a filed officer of {match.company_name} but not a "
+                        f"person with significant control. The appointment is confirmed; the "
+                        f"shareholding is not, and remains an assumption."
+                    )
 
         return match, (
-            f"Company found on the register, but “{person_name}” does not appear as a "
-            f"person with significant control. They may hold under 25%, or hold through "
-            f"another entity."
+            f"{match.company_name} was found on the register, but “{person_name}” appears "
+            f"neither as a person with significant control nor as a current officer. They "
+            f"may hold under 25%, hold through another entity, or the name match may be wrong."
         )
     except requests.RequestException as error:
         return None, f"Companies House unreachable: {error}"

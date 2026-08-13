@@ -1,9 +1,14 @@
-"""The weekly research run.
+"""The research run.
 
 One function, `run_research`, does the whole sweep: build the query matrix, fetch
 every feed, extract events, score them, and write prospects with their sources.
 It is safe to run repeatedly — URLs already processed are skipped, and an
 existing prospect is only revised when the new evidence is at least as good.
+
+The run is deliberately allowed to take a long time. Yield comes from breadth:
+more markets, more towns folded into each query, more windows. What it must never
+do is trade accuracy for volume, so every article still has to name a wealth
+event, and geography is still checked rather than assumed.
 """
 
 from __future__ import annotations
@@ -15,10 +20,18 @@ from typing import Callable
 
 from . import db
 from .extract import ExtractedEvent, extract_event
-from .queries import EVENT_BY_KEY, PUBLISHER_FEEDS, build_search_matrix
+from .markets import MARKET_BY_KEY, expand_selection
+from .queries import (
+    DEFAULT_DEPTH,
+    DEPTH_BY_KEY,
+    EVENT_BY_KEY,
+    PUBLISHER_FEEDS,
+    build_search_matrix,
+)
 from .scoring import cohort_for, estimate_from_event, score_confidence
 from .sources import Fetcher, fetch_feed, verify_with_companies_house
 
+#: ``(message, fraction_complete)``
 ProgressCallback = Callable[[str, float], None]
 
 
@@ -27,64 +40,104 @@ class RunResult:
     run_id: int
     week: str
     status: str
+    depth: str = DEFAULT_DEPTH
+    markets: tuple[str, ...] = ()
+    queries_planned: int = 0
     queries_run: int = 0
     articles_seen: int = 0
     events_kept: int = 0
     new_prospects: int = 0
     updated_prospects: int = 0
     company_leads: int = 0
+    rejected: int = 0
     warnings: list[str] = field(default_factory=list)
     log: list[str] = field(default_factory=list)
     duration_seconds: float = 0.0
+    stopped_early: bool = False
 
 
 def run_research(
     *,
     trigger: str = "manual",
-    days: int = 7,
-    regions: list[str] | None = None,
+    depth: str = DEFAULT_DEPTH,
+    market_keys: list[str] | tuple[str, ...] | None = None,
+    days: int | None = None,
     event_keys: list[str] | None = None,
-    include_publishers: bool = True,
+    include_publishers: bool | None = None,
     verify_companies_house: bool = False,
     max_queries: int | None = None,
+    time_budget_seconds: float | None = None,
     progress: ProgressCallback | None = None,
 ) -> RunResult:
     """Sweep the sources and update the book.
 
-    ``days`` bounds how far back to look, which is what makes a weekly run cheap:
-    we ask only for what has appeared since the last one.
+    ``time_budget_seconds`` stops the run cleanly when the budget is spent rather
+    than being killed halfway through: everything found so far is already stored,
+    and the run is recorded as partial so the report can say it was cut short.
     """
     started = datetime.now(timezone.utc)
     db.init_db()
     fetcher = Fetcher()
 
-    matrix = build_search_matrix(days=days, regions=regions, event_keys=event_keys)
+    settings = DEPTH_BY_KEY.get(depth, DEPTH_BY_KEY[DEFAULT_DEPTH])
+    markets = expand_selection(market_keys)
+    publishers_on = (
+        settings.include_publishers if include_publishers is None else include_publishers
+    )
+
+    matrix = build_search_matrix(
+        market_keys=markets, depth=depth, event_keys=event_keys, days=days
+    )
     if max_queries:
         matrix = matrix[:max_queries]
 
-    feeds: list[tuple[str, str, str | None]] = [
-        (q.url, "Google News", q.event_key) for q in matrix
+    #: ``(url, publisher, event_key, market_key)`` — a publisher feed has no
+    #: market context, so anything it turns up must locate itself from its text.
+    feeds: list[tuple[str, str, str | None, str | None]] = [
+        (q.url, "Google News", q.event_key, q.market_key) for q in matrix
     ]
-    if include_publishers:
-        feeds += [(url, name, None) for name, url in PUBLISHER_FEEDS]
+    if publishers_on:
+        feeds += [(url, name, None, None) for name, url in PUBLISHER_FEEDS]
 
     with db.connect() as conn:
-        run_id = db.start_run(conn, trigger)
+        run_id = db.start_run(conn, trigger, depth=depth, markets=list(markets),
+                              queries_planned=len(feeds))
 
-    result = RunResult(run_id=run_id, week=db.iso_week(started), status="running")
+    result = RunResult(
+        run_id=run_id, week=db.iso_week(started), status="running",
+        depth=depth, markets=tuple(markets), queries_planned=len(feeds),
+    )
     ch_disabled_reason: str | None = None
 
-    for index, (url, publisher, event_key) in enumerate(feeds):
+    for index, (url, publisher, event_key, market_key) in enumerate(feeds):
+        if time_budget_seconds is not None:
+            spent = (datetime.now(timezone.utc) - started).total_seconds()
+            if spent > time_budget_seconds:
+                result.stopped_early = True
+                result.warnings.append(
+                    f"Stopped after {spent / 60:.0f} minutes with "
+                    f"{len(feeds) - index} of {len(feeds)} searches unrun — the time "
+                    f"budget was reached. Everything found so far is saved; run again "
+                    f"to continue, as processed articles are skipped."
+                )
+                break
+
         if progress:
+            where = MARKET_BY_KEY[market_key].name if market_key else publisher
             progress(
-                f"Searching {publisher} ({index + 1} of {len(feeds)})",
+                f"{where} · {EVENT_BY_KEY[event_key].label if event_key else 'broad sweep'}"
+                f"  ({index + 1} of {len(feeds)}) · {result.new_prospects} found",
                 (index + 1) / max(len(feeds), 1),
             )
 
         articles, warning = fetch_feed(fetcher, url, publisher=publisher)
         result.queries_run += 1
         if warning:
-            result.warnings.append(warning)
+            # One line per failing host, not per query: a blocked publisher would
+            # otherwise fill the log with hundreds of identical entries.
+            host = warning.split(":")[0]
+            if not any(w.startswith(host) for w in result.warnings):
+                result.warnings.append(warning)
             continue
 
         result.articles_seen += len(articles)
@@ -102,8 +155,11 @@ def run_research(
                 publisher=article.publisher or publisher,
                 published_at=article.published_at,
                 query_event_key=event_key,
+                query_market_key=market_key,
+                allowed_markets=markets,
             )
             if event is None:
+                result.rejected += 1
                 continue
 
             result.events_kept += 1
@@ -118,19 +174,25 @@ def run_research(
                 # A key problem is systemic; report it once and stop retrying.
                 if "rejected the key" in warning_text or "unreachable" in warning_text:
                     ch_disabled_reason = warning_text
-                    result.warnings.append(f"Companies House verification disabled: {warning_text}")
-                elif warning_text not in result.warnings:
-                    result.warnings.append(warning_text)
+                    result.warnings.append(
+                        f"Companies House verification disabled: {warning_text}"
+                    )
 
             if outcome["kind"] == "new":
                 result.new_prospects += 1
-                result.log.append(f"New prospect: {outcome['name']} ({event.region}) — {event.event_label}")
+                result.log.append(
+                    f"New · {outcome['name']} · {event.market_name} · {event.event_label}"
+                    + (f" · {event.publisher}" if event.publisher else "")
+                )
             elif outcome["kind"] == "updated":
                 result.updated_prospects += 1
             elif outcome["kind"] == "company_lead":
                 result.company_leads += 1
 
-    result.status = "success" if not result.warnings else "partial"
+    if result.stopped_early:
+        result.status = "partial"
+    else:
+        result.status = "success" if not result.warnings else "partial"
     result.duration_seconds = (datetime.now(timezone.utc) - started).total_seconds()
 
     with db.connect() as conn:
@@ -142,6 +204,7 @@ def run_research(
             events_kept=result.events_kept,
             new_prospects=result.new_prospects,
             updated_prospects=result.updated_prospects,
+            company_leads=result.company_leads,
             warnings=result.warnings,
             log=result.log,
         )
@@ -162,7 +225,10 @@ def _store_event(
 
     person = event.people[0]
 
-    if verify_ch and event.company:
+    # Companies House is the *UK* register. Running a Dubai or Texas company
+    # through it would either find nothing or, worse, find a same-named British
+    # company and attach the wrong number to a real person.
+    if verify_ch and event.company and event.country == "United Kingdom":
         ch_match, ch_warning = verify_with_companies_house(
             fetcher, company_name=event.company, person_name=person.name
         )
@@ -178,7 +244,7 @@ def _store_event(
         known_stake_band=ch_match.ownership_band if ch_match else None,
     )
 
-    slug = db.slugify(f"{person.name}-{event.region}")
+    slug = db.slugify(f"{person.name}-{event.market_key}")
 
     with db.connect() as conn:
         existing = conn.execute(
@@ -193,8 +259,9 @@ def _store_event(
             source_count=prior_sources + 1,
             event_weight=event.weight,
             stake_verified=stake_verified,
-            companies_house_verified=bool(ch_match),
+            companies_house_verified=bool(ch_match and ch_match.matched_via),
             estimate_is_none=estimate.investable_mid_gbp is None,
+            location_from_text=event.market_source == "text",
         )
 
         record = {
@@ -202,7 +269,13 @@ def _store_event(
             "full_name": person.name,
             "job_title": person.title,
             "company": event.company,
-            "region": event.region,
+            "market_key": event.market_key,
+            "market_name": event.market_name,
+            "market_group": event.market_group,
+            "country": event.country,
+            "market_source": event.market_source,
+            "locality": event.locality,
+            "address": ch_match.registered_office if ch_match else None,
             "matched_place": event.matched_place,
             "gross_low_gbp": estimate.gross_low_gbp,
             "gross_mid_gbp": estimate.gross_mid_gbp,
@@ -225,8 +298,11 @@ def _store_event(
             "rationale": _build_rationale(event, estimate),
             "primary_event": event.event_label,
             "ch_company_number": ch_match.company_number if ch_match else None,
+            "ch_company_name": ch_match.company_name if ch_match else None,
             "ch_officer_name": ch_match.officer_name if ch_match else None,
             "ch_ownership_band": ch_match.ownership_band if ch_match else None,
+            "ch_registered_office": ch_match.registered_office if ch_match else None,
+            "ch_profile_url": ch_match.profile_url if ch_match else None,
             "ch_verified_at": db.now_iso() if ch_match else None,
             "first_seen": db.now_iso(),
             "last_updated": db.now_iso(),
@@ -261,6 +337,12 @@ def _store_event(
                          f"Shareholding confirmed on the Companies House PSC register: "
                          f"{ch_match.ownership_band} of {ch_match.company_name}.",
                          ch_match.profile_url)
+        elif ch_match and ch_match.matched_via == "officer":
+            db.add_event(conn, prospect_id, "verified",
+                         f"Confirmed as a filed officer of {ch_match.company_name} "
+                         f"({ch_match.company_number}). The appointment is verified; the "
+                         f"shareholding is not.",
+                         ch_match.profile_url)
 
     return {
         "kind": "new" if created else "updated",
@@ -277,8 +359,17 @@ def _build_rationale(event: ExtractedEvent, estimate) -> str:
     who = event.people[0].name if event.people else "An unnamed individual"
     role = f", {event.people[0].title}" if event.people else ""
     company = f" of {event.company}" if event.company else ""
+    where = event.locality or event.market_name
 
-    parts.append(f"{who}{role}{company} was identified from a reported {event.event_label.lower()} in {event.region}.")
+    parts.append(
+        f"{who}{role}{company} was identified from a reported "
+        f"{event.event_label.lower()} in {where}, {event.country}."
+    )
+    if event.market_source == "query":
+        parts.append(
+            f"The article does not name the location; {event.market_name} is inferred "
+            f"from the search that found it, and the confidence score reflects that."
+        )
     if template:
         parts.append(template.meaning)
 
@@ -289,6 +380,7 @@ def _build_rationale(event: ExtractedEvent, estimate) -> str:
 
     parts.append(
         "This is derived from press reporting, not from a statutory filing. "
-        "Verify the shareholding on Companies House before treating any figure as reliable."
+        "Verify the shareholding on the company register before treating any figure "
+        "as reliable."
     )
     return " ".join(parts)

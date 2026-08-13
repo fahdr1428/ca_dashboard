@@ -1,5 +1,9 @@
 # Deploying to Vercel
 
+> This covers the **Next.js dashboard**. For the Streamlit research app — the one
+> that finds prospects from news across 70 markets, and deploys free on Streamlit
+> Community Cloud — see **[RESEARCH_APP.md](RESEARCH_APP.md)**.
+
 Roughly ten minutes, most of it waiting for builds. The app is deployment-ready:
 `vercel.json` already declares the Monday cron, and the build runs
 `prisma generate` before `next build`.

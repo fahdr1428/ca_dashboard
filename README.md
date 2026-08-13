@@ -1,13 +1,19 @@
 # Wealth Advisor Lead Intelligence
 
-A prospect-identification dashboard for a private wealth advisor covering the
-south of England. It finds individuals likely to hold significant investable
-assets, estimates what those assets are, shows exactly how each estimate was
-derived, and refreshes itself weekly.
+Prospect identification for a private wealth advisor. It finds individuals likely
+to hold significant investable assets, estimates what those assets are, shows
+exactly how each estimate was derived, and refreshes itself weekly.
 
-Built on Next.js 15, React 19, TypeScript, Tailwind CSS 4, PostgreSQL and
-Prisma, with Recharts for charts and an inline SVG map drawn from ONS boundary
-data.
+There are **two apps in this repository**, and most people want the first one:
+
+- **[Research app](RESEARCH_APP.md)** (Python/Streamlit) — discovers prospects
+  from public news across 70 markets in the UK, the US, the Middle East, Europe
+  and Asia-Pacific. `pip install -r requirements.txt && streamlit run streamlit_app.py`
+  and you are running.
+- **Dashboard** (Next.js 15, React 19, TypeScript, Tailwind 4, PostgreSQL,
+  Prisma, Recharts, and an inline SVG map from ONS boundary data) — verifies
+  ownership and financials against the Companies House register for the original
+  13 southern English counties. Documented in the rest of this file.
 
 ---
 
@@ -36,16 +42,18 @@ doing its job.
 
 | | **Research app** (Streamlit, Python) | **Dashboard** (Next.js, TypeScript) |
 | --- | --- | --- |
-| **Finds prospects by** | Searching public news weekly — 182 targeted queries across the 13 counties | Reading the Companies House register and filed accounts |
+| **Finds prospects by** | Searching public news across 70 markets — UK, US, Middle East, Europe, Asia-Pacific | Reading the Companies House register and filed accounts |
+| **Geography** | 70 markets, chosen by preset | The 13 southern English counties |
 | **Needs** | `pip install` and one command | Postgres, a build step, a deployment |
-| **Companies House** | Optional bonus — verifies an assumed stake | Required; it is the whole data source |
+| **Companies House** | Optional bonus — verifies an assumed stake and supplies an address | Required; it is the whole data source |
 | **Start with** | `streamlit run streamlit_app.py` | `npm run setup && npm run dev` |
 | **Docs** | **[RESEARCH_APP.md](RESEARCH_APP.md)** | this file |
 
-If you want prospects discovered from news with no infrastructure to set up,
-use the **research app**. If you want ownership and financials verified against
-the statutory register, use the **Next.js dashboard**. They share the same 13
-counties, the same thresholds, and the same rule that an estimate is never
+If you want prospects **discovered** — people you have never heard of, anywhere
+from Cornwall to Riyadh, with no infrastructure to set up — use the **research
+app**. If you want ownership and financials **verified** against the statutory
+register for the original southern-England patch, use the **Next.js dashboard**.
+They share the same thresholds and the same rule that an estimate is never
 presented as a fact.
 
 ---

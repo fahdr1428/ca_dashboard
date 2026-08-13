@@ -14,7 +14,6 @@ from typing import Any
 
 from . import db
 from .config import PRIORITY_THRESHOLD_GBP, QUALIFYING_THRESHOLD_GBP
-from .regions import REGIONS
 
 
 def fmt_gbp(amount: int | float | None) -> str:
@@ -51,7 +50,7 @@ def build_report(week: str | None = None) -> tuple[dict[str, Any], str]:
 
         # Corroborations recorded this week against prospects found earlier.
         changes = conn.execute(
-            """SELECT e.*, p.full_name, p.slug, p.region, p.company
+            """SELECT e.*, p.full_name, p.slug, p.market_name, p.company
                FROM events e JOIN prospects p ON p.id = e.prospect_id
                WHERE e.created_at >= ? AND p.first_seen_week != ?
                  AND p.suppressed_at IS NULL
@@ -75,20 +74,25 @@ def build_report(week: str | None = None) -> tuple[dict[str, Any], str]:
     unestimated = [r for r in all_rows if r["investable_mid_gbp"] is None]
     addressable = sum(r["investable_mid_gbp"] for r in qualifying)
 
-    by_region: list[dict[str, Any]] = []
-    for region in REGIONS:
-        members = [r for r in all_rows if r["region"] == region]
-        if not members:
-            continue
-        by_region.append({
-            "region": region,
-            "total": len(members),
-            "qualifying": len([r for r in members if r in qualifying]),
-            "addressable_gbp": sum(
-                r["investable_mid_gbp"] or 0 for r in members if r in qualifying
-            ),
-        })
-    by_region.sort(key=lambda r: r["addressable_gbp"], reverse=True)
+    qualifying_ids = {r["id"] for r in qualifying}
+
+    def _breakdown(column: str, label: str) -> list[dict[str, Any]]:
+        buckets: dict[str, dict[str, Any]] = {}
+        for row in all_rows:
+            name = row[column] or "Unknown"
+            bucket = buckets.setdefault(
+                name, {label: name, "total": 0, "qualifying": 0, "addressable_gbp": 0}
+            )
+            bucket["total"] += 1
+            if row["id"] in qualifying_ids:
+                bucket["qualifying"] += 1
+                bucket["addressable_gbp"] += row["investable_mid_gbp"] or 0
+        return sorted(
+            buckets.values(), key=lambda r: (r["addressable_gbp"], r["total"]), reverse=True
+        )
+
+    by_market = _breakdown("market_name", "market")
+    by_country = _breakdown("country", "country")
 
     payload: dict[str, Any] = {
         "week": target_week,
@@ -108,7 +112,11 @@ def build_report(week: str | None = None) -> tuple[dict[str, Any], str]:
                 "name": r["full_name"],
                 "job_title": r["job_title"],
                 "company": r["company"],
-                "region": r["region"],
+                "market": r["market_name"],
+                "country": r["country"],
+                "locality": r["locality"],
+                "address": r["address"] or r["ch_registered_office"],
+                "location_evidenced": r["market_source"] == "text",
                 "event": r["primary_event"],
                 "band": r["wealth_band"],
                 "cohort": r["cohort"],
@@ -139,7 +147,7 @@ def build_report(week: str | None = None) -> tuple[dict[str, Any], str]:
         "changes": [
             {
                 "name": c["full_name"],
-                "region": c["region"],
+                "market": c["market_name"],
                 "company": c["company"],
                 "kind": c["kind"],
                 "message": c["message"],
@@ -148,10 +156,14 @@ def build_report(week: str | None = None) -> tuple[dict[str, Any], str]:
             }
             for c in changes[:40]
         ],
-        "by_region": by_region,
+        "by_market": by_market,
+        "by_country": by_country,
         "run": {
             "queries": latest_run["queries_run"] if latest_run else 0,
+            "planned": (latest_run["queries_planned"] if latest_run else 0) or 0,
             "articles": latest_run["articles_seen"] if latest_run else 0,
+            "depth": (latest_run["depth"] if latest_run else None) or "unknown",
+            "markets": len(json.loads((latest_run["markets"] if latest_run else None) or "[]")),
             "warnings": json.loads(latest_run["warnings"] or "[]") if latest_run else [],
         },
     }
@@ -192,9 +204,9 @@ def render_markdown(payload: dict[str, Any]) -> str:
     lines.append("")
     if not payload["new_prospects"]:
         lines.append(
-            "_No new prospects were identified this week. The sweep ran and found "
-            "nothing meeting the criteria — which is a normal outcome for a single "
-            "week across 13 counties._"
+            "_No new prospects were identified this week. If that is unexpected, widen "
+            "the markets or raise the search depth — a narrow sweep over a single week "
+            "legitimately returns nothing._"
         )
         lines.append("")
     else:
@@ -205,7 +217,20 @@ def render_markdown(payload: dict[str, Any]) -> str:
             lines.append(f"### {heading}")
             lines.append("")
             lines.append(f"- **Company:** {person['company'] or 'not identified'}")
-            lines.append(f"- **County:** {person['region']}")
+
+            where = person["market"]
+            if person["locality"]:
+                where = f"{person['locality']}, {where}"
+            if person["country"] and person["country"] not in where:
+                where = f"{where}, {person['country']}"
+            if not person["location_evidenced"]:
+                where += " _(inferred from the search, not stated in the source)_"
+            lines.append(f"- **Location:** {where}")
+            if person["address"]:
+                lines.append(
+                    f"- **Registered office:** {person['address']} "
+                    f"_(the company's filed address, not a home address)_"
+                )
             lines.append(f"- **Why identified:** {person['event']}")
             lines.append(f"- **Cohort:** {person['cohort']}")
 
@@ -251,19 +276,31 @@ def render_markdown(payload: dict[str, Any]) -> str:
         lines.append("_No new developments on prospects already on the list._")
     else:
         for change in payload["changes"]:
-            where = change["region"]
+            where = change["market"]
             company = f", {change['company']}" if change["company"] else ""
             lines.append(f"- **{change['name']}** ({where}{company}): {change['message']}")
     lines.append("")
 
-    if payload["by_region"]:
-        lines.append("## Coverage by county")
+    if payload["by_country"]:
+        lines.append("## Coverage by country")
         lines.append("")
-        lines.append("| County | Tracked | Qualifying | Estimated addressable |")
+        lines.append("| Country | Tracked | Qualifying | Estimated addressable |")
         lines.append("| --- | ---: | ---: | ---: |")
-        for row in payload["by_region"]:
+        for row in payload["by_country"]:
             lines.append(
-                f"| {row['region']} | {row['total']} | {row['qualifying']} | "
+                f"| {row['country']} | {row['total']} | {row['qualifying']} | "
+                f"{fmt_gbp(row['addressable_gbp'])} |"
+            )
+        lines.append("")
+
+    if payload["by_market"]:
+        lines.append("## Coverage by market")
+        lines.append("")
+        lines.append("| Market | Tracked | Qualifying | Estimated addressable |")
+        lines.append("| --- | ---: | ---: | ---: |")
+        for row in payload["by_market"][:40]:
+            lines.append(
+                f"| {row['market']} | {row['total']} | {row['qualifying']} | "
                 f"{fmt_gbp(row['addressable_gbp'])} |"
             )
         lines.append("")
@@ -272,7 +309,9 @@ def render_markdown(payload: dict[str, Any]) -> str:
     lines.append("## How this week's search ran")
     lines.append("")
     lines.append(
-        f"{run['queries']} searches across 13 counties and 14 wealth-event patterns, "
+        f"{run['queries']} searches"
+        + (f" of {run['planned']} planned" if run["planned"] > run["queries"] else "")
+        + f" at *{run['depth']}* depth across {run['markets']} market(s), "
         f"reading {run['articles']} articles."
     )
     if totals["not_estimated"]:

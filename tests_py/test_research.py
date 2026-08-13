@@ -5,9 +5,14 @@ Written with unittest so there is no extra dependency to install:
     python -m unittest discover -s tests_py -v
 
 The tests that matter most are the ones asserting what the app *refuses* to do:
-inventing a person, guessing a figure, or claiming something is verified when it
-is not. Those are the failures that would make this tool dangerous rather than
-merely wrong.
+inventing a person, guessing a figure, claiming something is verified when it is
+not, or filing someone in a country they have nothing to do with. Those are the
+failures that would make this tool dangerous rather than merely wrong.
+
+Second in importance are the yield tests. An extractor that discards a perfectly
+good £64m exit because the 200-character snippet didn't repeat the county name is
+not "cautious", it is broken — that bug is what limited the first version of this
+app to a single result, and `test_inherits_market_from_the_query` pins the fix.
 """
 
 from __future__ import annotations
@@ -21,43 +26,108 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from wealthscan.extract import (  # noqa: E402
     classify, extract_company, extract_event, extract_people, parse_money,
 )
-from wealthscan.queries import EVENT_TEMPLATES, build_search_matrix, google_news_url  # noqa: E402
-from wealthscan.regions import REGIONS, resolve_region  # noqa: E402
+from wealthscan.markets import (  # noqa: E402
+    ALL_MARKETS, CORE_MARKET_KEYS, GROUP_ORDER, MARKET_BY_KEY, PRESETS,
+    expand_selection, locale_for, most_specific_place, resolve_market,
+)
+from wealthscan.queries import (  # noqa: E402
+    DEPTHS, EVENT_TEMPLATES, build_search_matrix, google_news_url, place_blocks,
+    plan_sweep,
+)
 from wealthscan.report import fmt_gbp, week_bounds  # noqa: E402
 from wealthscan.scoring import (  # noqa: E402
     band_for, cohort_for, estimate_from_event, score_confidence,
 )
 
+UK = tuple(m.key for m in ALL_MARKETS if m.country == "United Kingdom")
 
-class TestRegions(unittest.TestCase):
-    def test_resolves_county_and_town(self):
+
+class TestMarkets(unittest.TestCase):
+    def test_resolves_market_and_town(self):
         for text, expected in [
             ("Exeter engineering firm sold", "Devon"),
             ("Truro hotelier expands", "Cornwall"),
             ("a Weybridge founder exits", "Surrey"),
             ("Canary Wharf fund manager", "Greater London"),
             ("Cirencester food group grows", "Gloucestershire"),
+            ("Palo Alto software group acquired", "San Francisco Bay Area"),
+            ("DIFC founder sells stake", "Dubai"),
+            ("Riyadh family office launched", "Riyadh"),
+            ("Zug commodities house sold", "Switzerland"),
         ]:
-            self.assertEqual(resolve_region(text)[0], expected, text)
+            match = resolve_market(text)
+            self.assertIsNotNone(match, text)
+            self.assertEqual(match.market_name, expected, text)
+            self.assertEqual(match.source, "text")
 
-    def test_discards_out_of_scope(self):
-        """Out of scope must be None, never a default. A wrong county puts a
-        prospect in front of an advisor who has no business contacting them."""
-        for text in ["Manchester tech firm raises £10m", "Edinburgh founder sells up",
-                     "Londonderry business", "New Hampshire startup", "", None]:
-            self.assertIsNone(resolve_region(text)[0], repr(text))
+    def test_unlocatable_text_is_none(self):
+        """None, never a default. A wrong location puts a prospect in front of an
+        advisor who has no business contacting them."""
+        for text in ["a factory was sold", "revenue rose sharply", "", None]:
+            self.assertIsNone(resolve_market(text), repr(text))
 
     def test_ambiguous_place_needs_corroboration(self):
         # "Bath" appears in far more articles about bathrooms than about Somerset.
-        self.assertIsNone(resolve_region("luxury bath and shower fittings")[0])
-        self.assertEqual(resolve_region("Bath, Somerset firm sold")[0], "Somerset")
+        self.assertIsNone(resolve_market("luxury bath and shower fittings"))
+        self.assertEqual(resolve_market("Bath, Somerset firm sold").market_name, "Somerset")
 
-    def test_every_region_has_data(self):
-        from wealthscan.regions import REGION_DATA
-        self.assertEqual(len(REGIONS), 13)
-        for name in REGIONS:
-            self.assertIn(name, REGION_DATA)
-            self.assertTrue(REGION_DATA[name].places)
+    def test_negative_phrases_are_stripped(self):
+        # A Connecticut town called Bristol is not the English city.
+        self.assertIsNone(resolve_market("Bristol Connecticut manufacturer sold"))
+        self.assertIsNone(resolve_market("London Ontario firm expands"))
+
+    def test_preference_beats_a_later_exact_match(self):
+        """The market that found the article wins ties, or a Devon founder ends up
+        filed in Manhattan because the buyer happened to be American."""
+        text = "The Exeter firm was bought by a New York group"
+        self.assertEqual(resolve_market(text, prefer="uk-devon").market_name, "Devon")
+        # Without the preference the decisive exact-name match takes it.
+        self.assertEqual(resolve_market(text).market_name, "New York")
+
+    def test_most_specific_place_prefers_the_town(self):
+        self.assertEqual(
+            most_specific_place("Newton Abbot engineering group in Devon", "uk-devon"),
+            "Newton Abbot",
+        )
+        # Only the market name present means there is no locality to add.
+        self.assertIsNone(most_specific_place("a Devon business", "uk-devon"))
+
+    def test_every_market_is_well_formed(self):
+        self.assertEqual(len(CORE_MARKET_KEYS), 13, "the original patch is still a preset")
+        for market in ALL_MARKETS:
+            self.assertTrue(market.places, market.key)
+            self.assertIn(market.group, GROUP_ORDER, market.key)
+            self.assertTrue(market.country and market.currency, market.key)
+            # Some markets carry an editorial label ("Home Counties", "Connecticut
+            # & Tri-State"). Searching for the label finds nothing, so the first
+            # place must be a real, searchable name.
+            leading = market.places[0]
+            self.assertTrue(leading and leading[0].isupper(), market.key)
+            self.assertNotIn("&", leading, market.key)
+            self.assertNotIn("(", leading, market.key)
+
+    def test_presets_resolve_to_real_markets(self):
+        for name, keys in PRESETS.items():
+            self.assertTrue(keys, name)
+            for key in keys:
+                self.assertIn(key, MARKET_BY_KEY, f"{name} → {key}")
+
+    def test_expand_selection_accepts_groups_and_presets(self):
+        self.assertEqual(
+            set(expand_selection(["United Kingdom"])),
+            {m.key for m in ALL_MARKETS if m.group == "United Kingdom"},
+        )
+        self.assertEqual(
+            set(expand_selection(["Everywhere"])), {m.key for m in ALL_MARKETS}
+        )
+        # Empty means everywhere, not nowhere.
+        self.assertEqual(len(expand_selection(None)), len(ALL_MARKETS))
+
+    def test_locale_follows_the_country(self):
+        # gl decides which publishers Google surfaces at all.
+        self.assertEqual(locale_for("uk-devon"), ("en-GB", "GB"))
+        self.assertEqual(locale_for("us-texas"), ("en-US", "US"))
+        self.assertEqual(locale_for("ae-dubai"), ("en-AE", "AE"))
 
 
 class TestMoney(unittest.TestCase):
@@ -69,9 +139,18 @@ class TestMoney(unittest.TestCase):
         self.assertEqual(parse_money("worth £1,250,000"), 1_250_000)
 
     def test_converts_foreign_currency(self):
-        usd = parse_money("raises $30m")
-        self.assertIsNotNone(usd)
-        self.assertLess(usd, 30_000_000, "USD should be discounted to GBP")
+        for text in ("raises $30m", "sold for AED 300m", "a SAR 200m deal",
+                     "₹1,400 crore stake sale"):
+            value = parse_money(text)
+            self.assertIsNotNone(value, text)
+            self.assertGreater(value, 0, text)
+
+        # A Gulf headline must not be read as though the figure were sterling.
+        self.assertLess(parse_money("sold for AED 2.4bn"), 2_400_000_000)
+        self.assertLess(parse_money("raises $30m"), 30_000_000)
+
+    def test_trailing_currency_words(self):
+        self.assertEqual(parse_money("a deal worth 40 million pounds"), 40_000_000)
 
     def test_takes_the_largest_figure(self):
         # The deal value matters, not the turnover mentioned in passing.
@@ -99,10 +178,32 @@ class TestPeople(unittest.TestCase):
         self.assertEqual(people[0].name, "Alastair Wren")
         self.assertEqual(people[0].title, "", "no title was stated, so none is invented")
 
+    def test_subject_of_a_wealth_verb(self):
+        """"Name has sold…" is the commonest headline shape and used to be missed
+        entirely, which cost the app most of its yield."""
+        people = extract_people("Gareth Halberton has sold the business he founded")
+        self.assertEqual(people[0].name, "Gareth Halberton")
+
+    def test_names_with_honorifics_and_particles(self):
+        self.assertEqual(
+            extract_people("Sheikh Faisal Al Marwan has agreed the sale")[0].name,
+            "Faisal Al Marwan",
+        )
+        self.assertEqual(
+            extract_people("Owner Matthias von Hallwyl has agreed the sale")[0].name,
+            "Matthias von Hallwyl",
+        )
+
     def test_acquired_by_is_not_a_person(self):
         # "acquired by" nearly always takes a company, and treating the acquirer
         # as an individual would fabricate a prospect.
         self.assertEqual(extract_people("acquired by German rival Schmidt AG"), [])
+
+    def test_places_are_not_people(self):
+        """Every market's place names are excluded, or "Palm Beach has sold" becomes
+        a person with an estimated net worth."""
+        self.assertEqual(extract_people("Palm Beach has sold the site"), [])
+        self.assertEqual(extract_people("Hong Kong has raised its target"), [])
 
     def test_refuses_to_invent_people(self):
         for text in ["The Company Limited announced results",
@@ -110,6 +211,32 @@ class TestPeople(unittest.TestCase):
                      "founder Smith said",
                      "revenue rose sharply this year"]:
             self.assertEqual(extract_people(text), [], text)
+
+    def test_title_case_headlines_do_not_produce_people(self):
+        """Capitalised common nouns are the classic false positive: "US Firm Sold
+        for £40m" must not become a prospect named US Firm with £17m to invest."""
+        for text in ["US Firm Sold for £40m", "Devon Group Sells Stake",
+                     "Family Office Launched in Dubai", "Tech Startup Raises $30m"]:
+            self.assertEqual(extract_people(text), [], text)
+
+    def test_job_titles_are_not_part_of_the_name(self):
+        people = extract_people("Chief Executive Officer Anna Fairweather nets £12m")
+        self.assertEqual(people[0].name, "Anna Fairweather")
+        self.assertEqual(len(people), 1, "the same person must not appear twice")
+
+    def test_names_with_apostrophes_and_accents(self):
+        self.assertEqual(
+            extract_people("Co-founder Declan O'Loughlin retains a stake")[0].name,
+            "Declan O'Loughlin",
+        )
+        self.assertEqual(
+            extract_people("Founder Céline Duforêt has sold her stake")[0].name,
+            "Céline Duforêt",
+        )
+        self.assertEqual(
+            extract_people("Founder Emre Yıldırım has sold shares")[0].name,
+            "Emre Yıldırım",
+        )
 
     def test_company_extraction(self):
         self.assertEqual(
@@ -132,19 +259,57 @@ class TestClassification(unittest.TestCase):
             summary="Chairman Gareth Halberton has sold the business.",
             url="https://example.invalid/a", publisher="BusinessLive",
             published_at=None, query_event_key="acquisition",
+            query_market_key="uk-devon", allowed_markets=UK,
         )
         self.assertIsNotNone(event)
-        self.assertEqual(event.region, "Devon")
+        self.assertEqual(event.market_name, "Devon")
+        self.assertEqual(event.country, "United Kingdom")
+        self.assertEqual(event.market_source, "text")
+        self.assertEqual(event.locality, "Exeter")
         self.assertEqual(event.amount_gbp, 64_000_000)
         self.assertEqual(event.people[0].name, "Gareth Halberton")
         self.assertIn("Devon", event.rationale)
 
-    def test_rejects_out_of_region_and_non_events(self):
-        self.assertIsNone(extract_event(
-            title="Manchester firm sold for £20m", summary="", url="u",
-            publisher="p", published_at=None))
+    def test_inherits_market_from_the_query(self):
+        """The bug that limited the first version to a single result.
+
+        A Devon search returns a perfect Devon story naming a person and a £64m
+        exit; the 200-character snippet simply never repeats the word "Devon".
+        Discarding that threw away nearly everything.
+        """
+        event = extract_event(
+            title="Precision engineering group sold to German rival for £64m",
+            summary="Chairman Gareth Halberton has sold the business he founded in 1999.",
+            url="https://example.invalid/b", publisher="BusinessLive",
+            published_at=None, query_event_key="acquisition",
+            query_market_key="uk-devon", allowed_markets=UK,
+        )
+        self.assertIsNotNone(event, "an unlocated article must not be discarded")
+        self.assertEqual(event.market_name, "Devon")
+        # …but the inference has to be visible, not laundered into a fact.
+        self.assertEqual(event.market_source, "query")
+        self.assertIn("does not name the place", event.rationale)
+
+    def test_rejects_articles_positively_about_another_market(self):
+        """An inherited market is a guess about a silent article. An article that
+        names somewhere else is not silent, and must be thrown away."""
+        event = extract_event(
+            title="Manchester firm sold for £20m",
+            summary="The chief executive Alan Fothergill has sold the business.",
+            url="u", publisher="p", published_at=None,
+            query_event_key="acquisition",
+            query_market_key="uk-devon", allowed_markets=CORE_MARKET_KEYS,
+        )
+        self.assertIsNone(event)
+
+    def test_rejects_non_events(self):
         self.assertIsNone(extract_event(
             title="Exeter council opens a new library", summary="", url="u",
+            publisher="p", published_at=None, query_market_key="uk-devon"))
+
+    def test_rejects_when_nothing_locates_it(self):
+        self.assertIsNone(extract_event(
+            title="A company was sold for £20m", summary="", url="u",
             publisher="p", published_at=None))
 
 
@@ -226,6 +391,21 @@ class TestConfidence(unittest.TestCase):
         # a news-derived record is always the unevidenced shareholding.
         self.assertIn("PSC register", confidence.next_action)
 
+    def test_inferred_location_costs_confidence(self):
+        """Keeping an unlocated article is right. Scoring it as though the source
+        named the place would be laundering an inference into a fact."""
+        stated = score_confidence(
+            publisher="BBC", has_named_person=True, amount_disclosed=True,
+            source_count=1, event_weight=85, location_from_text=True,
+        )
+        inferred = score_confidence(
+            publisher="BBC", has_named_person=True, amount_disclosed=True,
+            source_count=1, event_weight=85, location_from_text=False,
+        )
+        self.assertGreater(stated.score, inferred.score)
+        location = next(d for d in inferred.dimensions if d.key == "location")
+        self.assertIn("inferred", location.explanation)
+
     def test_verification_raises_the_score(self):
         base = score_confidence(
             publisher="BusinessLive", has_named_person=True, amount_disclosed=True,
@@ -259,27 +439,59 @@ class TestConfidence(unittest.TestCase):
                                 stake_verified=True, companies_house_verified=True)
         worst = score_confidence(publisher="", has_named_person=False,
                                  amount_disclosed=False, source_count=1, event_weight=40,
-                                 estimate_is_none=True)
+                                 estimate_is_none=True, location_from_text=False)
         self.assertLessEqual(best.score, 100)
         self.assertGreaterEqual(worst.score, 0)
 
 
 class TestQueries(unittest.TestCase):
-    def test_matrix_covers_every_county_and_event(self):
-        matrix = build_search_matrix(days=7)
-        self.assertEqual(len(matrix), len(REGIONS) * len(EVENT_TEMPLATES))
-        self.assertEqual({q.region for q in matrix}, set(REGIONS))
+    def test_matrix_covers_every_market_and_event(self):
+        matrix = build_search_matrix(market_keys=["uk-devon", "us-texas"], depth="standard")
+        self.assertEqual({q.market_key for q in matrix}, {"uk-devon", "us-texas"})
+        self.assertEqual({q.event_key for q in matrix}, {t.key for t in EVENT_TEMPLATES})
 
-    def test_query_url_is_well_formed(self):
-        url = google_news_url('"Devon" (acquired)', days=7)
-        self.assertIn("news.google.com/rss/search", url)
-        self.assertIn("when%3A7d", url)
-        self.assertIn("gl=GB", url)
+    def test_query_url_carries_the_market_locale(self):
+        uk = google_news_url('"Devon" (acquired)', days=7, market_key="uk-devon")
+        self.assertIn("news.google.com/rss/search", uk)
+        self.assertIn("when%3A7d", uk)
+        self.assertIn("gl=GB", uk)
+
+        gulf = google_news_url('"Dubai" (acquired)', days=7, market_key="ae-dubai")
+        self.assertIn("gl=AE", gulf)
+
+    def test_towns_are_or_ed_rather_than_searched_separately(self):
+        """Recall without a request per town — the whole reason a deep sweep is
+        affordable at all."""
+        blocks = place_blocks("uk-devon", places=6, block_size=7)
+        self.assertEqual(len(blocks), 1)
+        self.assertIn('"Devon"', blocks[0])
+        self.assertIn(" OR ", blocks[0])
+        self.assertIn('"Exeter"', blocks[0])
+
+    def test_market_name_only_when_no_towns_requested(self):
+        self.assertEqual(place_blocks("uk-devon", places=0, block_size=7), ['"Devon"'])
+
+    def test_depth_changes_the_amount_of_work(self):
+        counts = [
+            len(build_search_matrix(market_keys=["uk-devon"], depth=d.key))
+            for d in DEPTHS
+        ]
+        self.assertEqual(counts, sorted(counts), "depths must be monotonically heavier")
+        self.assertLess(counts[0], counts[-1])
+
+    def test_plan_is_honest_about_the_cost(self):
+        plan = plan_sweep(market_keys=PRESETS["UK + US + Middle East"], depth="deep")
+        self.assertGreater(plan.queries, 500, "a deep multi-market sweep is a big job")
+        self.assertGreater(plan.seconds, 60)
+        self.assertIn("minutes", plan.human_time)
 
     def test_can_narrow_the_matrix(self):
-        matrix = build_search_matrix(days=7, regions=["Devon"], event_keys=["business_exit"])
+        matrix = build_search_matrix(
+            market_keys=["uk-devon"], depth="quick", event_keys=["business_exit"]
+        )
         self.assertEqual(len(matrix), 1)
-        self.assertEqual(matrix[0].region, "Devon")
+        self.assertEqual(matrix[0].market_key, "uk-devon")
+        self.assertEqual(matrix[0].event_key, "business_exit")
 
 
 class TestFormatting(unittest.TestCase):
@@ -294,10 +506,6 @@ class TestFormatting(unittest.TestCase):
         start, end = week_bounds("2026-W33")
         self.assertEqual(start.weekday(), 0, "starts on a Monday")
         self.assertEqual(end.weekday(), 6, "ends on a Sunday")
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class TestOwnershipBands(unittest.TestCase):
@@ -328,3 +536,121 @@ class TestOwnershipBands(unittest.TestCase):
         self.assertTrue(any("is an assumption" in c for c in assumed.caveats))
         # 62.5% filed midpoint beats the 55% default, so the figure moves up.
         self.assertGreater(filed.gross_mid_gbp, assumed.gross_mid_gbp)
+
+
+class TestStorage(unittest.TestCase):
+    """The database has to survive the move from counties to markets with the
+    records intact, because a user's book is the one thing here that is theirs."""
+
+    def _legacy_database(self, path: Path) -> None:
+        import sqlite3
+        conn = sqlite3.connect(path, isolation_level=None)
+        conn.executescript(
+            """
+            CREATE TABLE prospects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slug TEXT UNIQUE NOT NULL,
+                full_name TEXT NOT NULL,
+                job_title TEXT,
+                company TEXT,
+                region TEXT NOT NULL,
+                matched_place TEXT,
+                investable_mid_gbp INTEGER,
+                wealth_band TEXT NOT NULL DEFAULT 'Not estimated',
+                cohort TEXT NOT NULL DEFAULT 'Research lead',
+                confidence INTEGER NOT NULL DEFAULT 0,
+                confidence_band TEXT NOT NULL DEFAULT 'Low',
+                status TEXT NOT NULL DEFAULT 'New',
+                relationship_stage TEXT NOT NULL DEFAULT 'Unaware',
+                notes TEXT,
+                first_seen TEXT NOT NULL,
+                last_updated TEXT NOT NULL,
+                first_seen_week TEXT NOT NULL,
+                suppressed_at TEXT,
+                suppression_reason TEXT
+            );
+            CREATE INDEX idx_prospects_region ON prospects(region);
+            CREATE TABLE sources (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                prospect_id INTEGER REFERENCES prospects(id) ON DELETE CASCADE,
+                url TEXT NOT NULL, title TEXT NOT NULL, retrieved_at TEXT NOT NULL,
+                UNIQUE (prospect_id, url)
+            );
+            INSERT INTO prospects
+              (slug, full_name, region, matched_place, investable_mid_gbp, notes,
+               first_seen, last_updated, first_seen_week)
+            VALUES
+              ('a-devon', 'A Person', 'Devon', 'Exeter', 12000000, 'called back Tuesday',
+               '2026-01-01T00:00:00', '2026-01-01T00:00:00', '2026-W01');
+            INSERT INTO sources (prospect_id, url, title, retrieved_at)
+            VALUES (1, 'https://example.invalid/x', 'A headline', '2026-01-01T00:00:00');
+            """
+        )
+        conn.close()
+
+    def test_legacy_region_database_is_migrated(self):
+        import tempfile
+        from wealthscan import db
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "legacy.db"
+            self._legacy_database(path)
+            db.init_db(path)
+
+            with db.connect(path) as conn:
+                row = conn.execute("SELECT * FROM prospects").fetchone()
+                self.assertEqual(row["market_key"], "uk-devon")
+                self.assertEqual(row["market_name"], "Devon")
+                self.assertEqual(row["country"], "United Kingdom")
+                self.assertEqual(row["investable_mid_gbp"], 12_000_000)
+                self.assertEqual(row["notes"], "called back Tuesday",
+                                 "the advisor's own notes must survive")
+                # The citations must survive too: dropping the parent table with
+                # foreign keys on would have cascaded them away.
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) AS n FROM sources").fetchone()["n"], 1
+                )
+                self.assertIsNotNone(conn.execute(
+                    "SELECT name FROM sqlite_master WHERE name = 'idx_prospects_market'"
+                ).fetchone())
+
+            # Idempotent: running it again must not duplicate or destroy anything.
+            db.init_db(path)
+            with db.connect(path) as conn:
+                self.assertEqual(
+                    conn.execute("SELECT COUNT(*) AS n FROM prospects").fetchone()["n"], 1
+                )
+
+    def test_suppression_hides_a_record_without_deleting_it(self):
+        import tempfile
+        from wealthscan import db
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "book.db"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                prospect_id, created = db.upsert_prospect(conn, {
+                    "slug": "x", "full_name": "A Person", "market_key": "uk-devon",
+                    "market_name": "Devon", "country": "United Kingdom",
+                    "first_seen": db.now_iso(), "last_updated": db.now_iso(),
+                    "first_seen_week": db.iso_week(),
+                })
+                self.assertTrue(created)
+                db.suppress_prospect(conn, prospect_id, "objected by email")
+                self.assertEqual(len(db.all_prospects(conn)), 0)
+                self.assertEqual(len(db.all_prospects(conn, include_suppressed=True)), 1)
+
+                # A later sweep must not resurrect the estimate.
+                db.upsert_prospect(conn, {
+                    "slug": "x", "full_name": "A Person", "market_key": "uk-devon",
+                    "market_name": "Devon", "country": "United Kingdom",
+                    "investable_mid_gbp": 99_000_000, "confidence": 90,
+                    "first_seen": db.now_iso(), "last_updated": db.now_iso(),
+                    "first_seen_week": db.iso_week(),
+                })
+                row = db.prospect(conn, prospect_id)
+                self.assertIsNone(row["investable_mid_gbp"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

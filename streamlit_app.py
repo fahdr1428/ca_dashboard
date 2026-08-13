@@ -1,12 +1,16 @@
-"""Lead Intelligence — Streamlit research dashboard.
+"""Lead Intelligence — private wealth prospect research.
 
 Run it with:
 
     streamlit run streamlit_app.py
 
-No database server, no build step, no API key required to start. The weekly
-research sweep reads public news; Companies House verification is an optional
-bonus that turns an assumed shareholding into a filed one.
+No database server, no build step, no API key required to start. The research
+sweep reads public news across 70 markets; Companies House verification is an
+optional bonus that turns an assumed shareholding into a filed one.
+
+The interface is written for an advisor, not an engineer: every control says what
+it will do in plain English, every sweep shows what it will cost before it runs,
+and every figure on screen carries the reason it exists.
 """
 
 from __future__ import annotations
@@ -28,11 +32,27 @@ from wealthscan.config import (
     PRIORITY_THRESHOLD_GBP,
     QUALIFYING_THRESHOLD_GBP,
 )
-from wealthscan.queries import EVENT_TEMPLATES
-from wealthscan.regions import REGION_DATA, REGIONS
+from wealthscan.markets import (
+    ALL_MARKETS,
+    DEFAULT_PRESET,
+    GROUP_ORDER,
+    MARKET_BY_KEY,
+    PRESETS,
+    expand_selection,
+    markets_in_group,
+)
+from wealthscan.queries import (
+    DEFAULT_DEPTH,
+    DEPTHS,
+    DEPTH_BY_KEY,
+    EVENT_BY_KEY,
+    EVENT_TEMPLATES,
+    PUBLISHER_FEEDS,
+    plan_sweep,
+)
 from wealthscan.report import fmt_gbp, generate_and_store
 from wealthscan.research import run_research
-from wealthscan.sources import companies_house_available
+from wealthscan.sources import companies_house_available, companies_house_status
 
 st.set_page_config(
     page_title=f"{APP_NAME} — Private Wealth",
@@ -49,16 +69,18 @@ BAND_ORDER = [
 
 CSS = """
 <style>
-  .block-container { padding-top: 2rem; max-width: 1500px; }
-  [data-testid="stMetricValue"] { font-size: 1.65rem; font-variant-numeric: tabular-nums; }
-  [data-testid="stMetricLabel"] { font-size: 0.72rem; text-transform: uppercase; letter-spacing: .05em; opacity: .7; }
-  .est-note { font-size: .78rem; opacity: .72; line-height: 1.5; }
-  .pill { display:inline-block; padding:.1rem .45rem; border-radius:.35rem; font-size:.7rem;
+  .block-container { padding-top: 1.6rem; max-width: 1600px; }
+  [data-testid="stMetricValue"] { font-size: 1.6rem; font-variant-numeric: tabular-nums; }
+  [data-testid="stMetricLabel"] { font-size: .72rem; text-transform: uppercase;
+                                  letter-spacing: .05em; opacity: .7; }
+  .reason { font-size: .82rem; opacity: .8; line-height: 1.6; margin: .15rem 0 .5rem; }
+  .pill { display:inline-block; padding:.12rem .5rem; border-radius:.4rem; font-size:.7rem;
           font-weight:600; border:1px solid rgba(128,128,128,.35); margin-right:.3rem; }
-  .pill-filed { background:rgba(15,118,110,.16); border-color:rgba(15,118,110,.5); }
-  .pill-warn  { background:rgba(180,83,9,.16);  border-color:rgba(180,83,9,.5); }
-  .pill-none  { background:transparent; opacity:.7; }
-  .reason { font-size:.8rem; opacity:.78; line-height:1.55; margin:.15rem 0 .45rem; }
+  .pill-good { background:rgba(15,118,110,.18); border-color:rgba(15,118,110,.55); }
+  .pill-warn { background:rgba(180,83,9,.18);  border-color:rgba(180,83,9,.55); }
+  .pill-none { background:transparent; opacity:.7; }
+  .step { font-size:.72rem; text-transform:uppercase; letter-spacing:.08em;
+          opacity:.65; font-weight:700; margin-bottom:.2rem; }
   table { font-variant-numeric: tabular-nums; }
 </style>
 """
@@ -72,33 +94,49 @@ db.init_db()
 # ---------------------------------------------------------------------------
 
 
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=15)
 def load_prospects() -> pd.DataFrame:
     with db.connect() as conn:
         rows = [dict(r) for r in db.all_prospects(conn)]
     if not rows:
         return pd.DataFrame()
     frame = pd.DataFrame(rows)
-    frame["lat"] = frame["region"].map(lambda r: REGION_DATA[r].lat if r in REGION_DATA else None)
-    frame["lon"] = frame["region"].map(lambda r: REGION_DATA[r].lon if r in REGION_DATA else None)
+    frame["lat"] = frame["market_key"].map(
+        lambda k: MARKET_BY_KEY[k].lat if k in MARKET_BY_KEY else None
+    )
+    frame["lon"] = frame["market_key"].map(
+        lambda k: MARKET_BY_KEY[k].lon if k in MARKET_BY_KEY else None
+    )
     return frame
 
 
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=15)
 def load_runs() -> list[dict]:
     with db.connect() as conn:
-        return [dict(r) for r in db.runs(conn, limit=20)]
+        return [dict(r) for r in db.runs(conn, limit=25)]
 
 
-@st.cache_data(ttl=20)
+@st.cache_data(ttl=15)
 def load_reports() -> list[dict]:
     with db.connect() as conn:
         return [dict(r) for r in db.reports(conn)]
 
 
-def sources_for(prospect_id: int) -> list[dict]:
+@st.cache_data(ttl=15)
+def load_sources_index() -> dict[int, list[dict]]:
+    """Every citation, grouped by prospect.
+
+    Loaded in one query rather than one per row: the table shows a source link on
+    each line, and 300 prospects would otherwise mean 300 round trips per redraw.
+    """
     with db.connect() as conn:
-        return [dict(r) for r in db.prospect_sources(conn, prospect_id)]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM sources ORDER BY published_at DESC"
+        )]
+    index: dict[int, list[dict]] = {}
+    for row in rows:
+        index.setdefault(int(row["prospect_id"]), []).append(row)
+    return index
 
 
 def events_for(prospect_id: int) -> list[dict]:
@@ -110,6 +148,7 @@ def refresh() -> None:
     load_prospects.clear()
     load_runs.clear()
     load_reports.clear()
+    load_sources_index.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +174,10 @@ def present(row, key: str) -> bool:
     verification is the worst failure this app could have, so every optional
     field is tested through here.
     """
-    if key not in row:
+    try:
+        if key not in row:
+            return False
+    except TypeError:
         return False
     value = row[key]
     if value is None:
@@ -149,13 +191,522 @@ def present(row, key: str) -> bool:
 
 
 def confidence_pill(score: int, band: str) -> str:
-    css = "pill-filed" if score >= 68 else "pill-warn" if score >= 45 else "pill-none"
+    css = "pill-good" if score >= 68 else "pill-warn" if score >= 45 else "pill-none"
     return f'<span class="pill {css}">{band} · {score}</span>'
+
+
+def where_text(row) -> str:
+    """One readable location line, honest about how it was established."""
+    parts = [
+        str(row[k]) for k in ("locality", "market_name", "country") if present(row, k)
+    ]
+    # "Exeter, Devon, United Kingdom" — but never "Devon, Devon" or
+    # "Connecticut, Connecticut & Tri-State", so substrings count as duplicates.
+    kept: list[str] = []
+    for part in parts:
+        if any(part in seen or seen in part for seen in kept):
+            continue
+        kept.append(part)
+    return ", ".join(kept) or "—"
+
+
+# ---------------------------------------------------------------------------
+# Page: find prospects
+# ---------------------------------------------------------------------------
+
+
+def _market_selection() -> tuple[list[str], str]:
+    """Step 1 of the run page: where to look. Returns ``(market keys, label)``."""
+    st.markdown('<div class="step">Step 1 — where to look</div>', unsafe_allow_html=True)
+
+    preset_names = list(PRESETS)
+    preset = st.radio(
+        "Region preset",
+        preset_names,
+        index=preset_names.index(DEFAULT_PRESET),
+        horizontal=True,
+        label_visibility="collapsed",
+        help="Start here. You can fine-tune the exact markets underneath.",
+    )
+    keys = list(PRESETS[preset])
+
+    with st.expander(
+        f"Fine-tune the {len(keys)} markets in “{preset}” "
+        f"(optional — skip this and the preset is used as-is)"
+    ):
+        st.caption(
+            "Tick or untick individual markets. Anything you choose here replaces the "
+            "preset. Leave a group empty to search all of it."
+        )
+        chosen: list[str] = []
+        columns = st.columns(3)
+        for index, group in enumerate(GROUP_ORDER):
+            group_markets = markets_in_group(group)
+            with columns[index % 3]:
+                picked = st.multiselect(
+                    group,
+                    [m.key for m in group_markets],
+                    default=[m.key for m in group_markets if m.key in keys],
+                    format_func=lambda k: MARKET_BY_KEY[k].name,
+                    key=f"markets_{group}",
+                )
+                chosen.extend(picked)
+        if chosen and set(chosen) != set(keys):
+            keys = chosen
+            preset = f"{len(keys)} markets chosen by hand"
+
+    countries = sorted({MARKET_BY_KEY[k].country for k in keys if k in MARKET_BY_KEY})
+    st.caption(
+        f"**{len(keys)} markets** across **{len(countries)} countries**: "
+        + ", ".join(countries[:12])
+        + (f" and {len(countries) - 12} more" if len(countries) > 12 else "")
+    )
+    return keys, preset
+
+
+def _depth_selection() -> str:
+    st.markdown(
+        '<div class="step">Step 2 — how hard to look</div>', unsafe_allow_html=True
+    )
+    keys = [d.key for d in DEPTHS]
+    depth = st.radio(
+        "Search depth",
+        keys,
+        index=keys.index(DEFAULT_DEPTH),
+        format_func=lambda k: DEPTH_BY_KEY[k].label,
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    st.caption(DEPTH_BY_KEY[depth].description)
+    return depth
+
+
+def page_find(frame: pd.DataFrame) -> None:
+    st.title("Find prospects")
+    st.caption(
+        "Searches public news for the moments when people come into money — a "
+        "business sold, a round raised, a dividend paid, a company floated — then "
+        "works out who was named, where they are, and what it might be worth."
+    )
+
+    with db.connect() as conn:
+        due = db.run_due_this_week(conn)
+
+    if due:
+        st.info(
+            f"No sweep has run yet in **{db.iso_week()}**. The intended cadence is once "
+            f"at the start of each week, but you can run it whenever you like — "
+            f"articles already processed are skipped, so nothing is duplicated."
+        )
+
+    with st.container(border=True):
+        market_keys, preset_label = _market_selection()
+        st.divider()
+        depth = _depth_selection()
+        st.divider()
+
+        st.markdown('<div class="step">Step 3 — options</div>', unsafe_allow_html=True)
+        options = st.columns([1, 1, 1])
+        window = options[0].select_slider(
+            "Only news from the last…",
+            options=[0, 7, 14, 30, 60, 90, 180, 365],
+            value=0,
+            format_func=lambda d: "use the depth setting" if d == 0 else f"{d} days",
+            help="Leave this alone unless you want one specific window. A deep search "
+                 "already looks at both recent and older news.",
+        )
+        minutes = options[1].select_slider(
+            "Stop after at most…",
+            options=[2, 5, 10, 20, 45, 90, 0],
+            value=20,
+            format_func=lambda m: "no limit" if m == 0 else f"{m} minutes",
+            help="A safety valve. Everything found before the limit is kept, and running "
+                 "again continues where this left off.",
+        )
+        publishers = options[2].checkbox(
+            f"Also sweep {len(PUBLISHER_FEEDS)} business publishers",
+            value=DEPTH_BY_KEY[depth].include_publishers,
+            help="UK regional, US, and Gulf business press. These carry deal news that "
+                 "never reaches national aggregation.",
+        )
+
+        ch_ok = companies_house_available()
+        verify = st.checkbox(
+            "Verify UK companies against Companies House",
+            value=ch_ok,
+            disabled=not ch_ok,
+            help="Replaces the assumed shareholding with the filed PSC band, confirms the "
+                 "person is a real officer, and pulls the registered office address.",
+        )
+        events = st.multiselect(
+            "Limit to certain wealth events (optional — all of them otherwise)",
+            [t.key for t in EVENT_TEMPLATES],
+            format_func=lambda k: EVENT_BY_KEY[k].label,
+            default=[],
+        )
+
+    plan = plan_sweep(
+        market_keys=market_keys,
+        depth=depth,
+        event_keys=events or None,
+        days=window or None,
+        include_publishers=publishers,
+    )
+
+    summary = st.columns(4)
+    summary[0].metric("Searches", f"{plan.queries:,}")
+    summary[1].metric("Estimated time", plan.human_time)
+    summary[2].metric("Markets", plan.markets)
+    summary[3].metric("Event types", plan.events)
+    st.caption(
+        f"“{preset_label}” at *{DEPTH_BY_KEY[depth].label}* depth. Searches run one at a "
+        f"time with a deliberate pause between them, so the app stays a good citizen of "
+        f"the sites it reads. You can leave this running and come back."
+    )
+
+    if not ch_ok:
+        st.caption(
+            "**Companies House is not connected.** It is a bonus, not a requirement — "
+            "without it, shareholdings stay labelled as assumptions and no registered "
+            "office addresses are collected. See **How it works** for the two-minute setup."
+        )
+
+    if st.button("Start searching", type="primary", width="stretch"):
+        _execute_sweep(
+            depth=depth, market_keys=market_keys, events=events,
+            window=window, minutes=minutes, publishers=publishers, verify=verify,
+        )
+        return
+
+    if not frame.empty:
+        st.divider()
+        st.subheader("Recent sweeps")
+        _run_history()
+    else:
+        st.divider()
+        st.caption(
+            "Nothing on file yet. To see how the dashboard looks before running a live "
+            "search, load the fictional demo data with `python scripts/seed_demo.py`."
+        )
+
+
+def _execute_sweep(
+    *, depth: str, market_keys: list[str], events: list[str],
+    window: int, minutes: int, publishers: bool, verify: bool,
+) -> None:
+    status = st.status("Starting…", expanded=True)
+    bar = st.progress(0.0)
+
+    def report(message: str, fraction: float) -> None:
+        status.update(label=message)
+        bar.progress(min(1.0, fraction))
+
+    result = run_research(
+        trigger="manual",
+        depth=depth,
+        market_keys=market_keys,
+        event_keys=events or None,
+        days=window or None,
+        include_publishers=publishers,
+        verify_companies_house=verify,
+        time_budget_seconds=(minutes * 60) if minutes else None,
+        progress=report,
+    )
+    status.update(
+        label=f"Finished in {result.duration_seconds / 60:.1f} minutes — {result.status}",
+        state="complete",
+    )
+
+    metrics = st.columns(5)
+    metrics[0].metric("Searches run", f"{result.queries_run:,}")
+    metrics[1].metric("Articles read", f"{result.articles_seen:,}")
+    metrics[2].metric("New prospects", result.new_prospects)
+    metrics[3].metric("Corroborated", result.updated_prospects)
+    metrics[4].metric("Company-only leads", result.company_leads)
+
+    if result.new_prospects or result.updated_prospects:
+        with st.spinner("Updating the weekly research document…"):
+            generate_and_store()
+    refresh()
+
+    if result.new_prospects:
+        st.success(
+            f"**{result.new_prospects} new people found.** Open **Prospect list** in the "
+            f"sidebar to work through them."
+        )
+    elif result.company_leads:
+        st.warning(
+            f"No individuals were named, but {result.company_leads} transaction(s) were "
+            f"found with a company and no person. Those are listed in the run log below — "
+            f"the app will not invent a name to fill the gap."
+        )
+    else:
+        st.warning(
+            "Nothing met the criteria. Widen the markets, raise the depth, or lengthen "
+            "the look-back window — and check the warnings below in case the searches "
+            "themselves were blocked."
+        )
+
+    if result.log:
+        with st.expander(f"What was found ({len(result.log)} entries)", expanded=True):
+            for line in result.log:
+                st.text(line)
+    if result.warnings:
+        with st.expander(f"Sources that could not be read ({len(result.warnings)})"):
+            for warning in result.warnings:
+                st.text(warning)
+        st.caption(
+            "Some publishers block automated readers. A blocked feed simply means that "
+            "source contributed nothing this run. If *every* search failed, the network "
+            "this app is running on is blocking outbound requests."
+        )
+
+
+def _run_history() -> None:
+    runs = load_runs()
+    if not runs:
+        st.caption("No sweeps recorded yet.")
+        return
+    st.dataframe(
+        pd.DataFrame([{
+            "Started": r["started_at"][:16].replace("T", " "),
+            "Depth": r["depth"] or "—",
+            "Markets": len(json.loads(r["markets"] or "[]")),
+            "Searches": r["queries_run"],
+            "Articles": r["articles_seen"],
+            "New": r["new_prospects"],
+            "Corroborated": r["updated_prospects"],
+            "Status": r["status"],
+        } for r in runs]),
+        hide_index=True, width="stretch",
+        column_config={
+            "Searches": st.column_config.NumberColumn(format="localized"),
+            "Articles": st.column_config.NumberColumn(format="localized"),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Page: prospect list
+# ---------------------------------------------------------------------------
+
+
+SORTS = {
+    "Estimated investable assets (highest first)": ("investable_mid_gbp", False),
+    "Confidence (highest first)": ("confidence", False),
+    "Most recently found": ("first_seen", False),
+    "Name (A–Z)": ("full_name", True),
+}
+
+
+def _filters(frame: pd.DataFrame) -> pd.DataFrame:
+    """The filter bar. Everything is optional and nothing is preselected."""
+    with st.container(border=True):
+        top = st.columns([2.2, 1.4, 1.4, 1.5])
+        search = top[0].text_input(
+            "Search", placeholder="Name, company, town or address",
+        )
+        countries = top[1].multiselect(
+            "Country", sorted(frame["country"].dropna().unique()), placeholder="Any country",
+        )
+        groups = top[2].multiselect(
+            "Region", [g for g in GROUP_ORDER if g in set(frame["market_group"].dropna())],
+            placeholder="Any region",
+        )
+        sort_label = top[3].selectbox("Sort by", list(SORTS))
+
+        mid = st.columns([1.5, 1.4, 1.3, 1.3])
+        markets = mid[0].multiselect(
+            "Market", sorted(frame["market_name"].dropna().unique()), placeholder="Any market",
+        )
+        bands = mid[1].multiselect(
+            "Wealth band", [b for b in BAND_ORDER if b in set(frame["wealth_band"])],
+            placeholder="Any wealth band",
+        )
+        cohorts = mid[2].multiselect(
+            "Cohort", sorted(frame["cohort"].dropna().unique()), placeholder="Any cohort",
+        )
+        found_via = mid[3].multiselect(
+            "Found via", sorted(frame["primary_event"].dropna().unique()),
+            placeholder="Any wealth event",
+        )
+
+        bottom = st.columns([1.6, 1.15, 1.15, 1.15])
+        min_confidence = bottom[0].slider("Minimum confidence", 0, 100, 0, step=5)
+        only_estimated = bottom[1].toggle(
+            "Has a figure", value=False,
+            help="Hide records the app declined to put a number on.",
+        )
+        only_located = bottom[2].toggle(
+            "Location stated", value=False,
+            help="Hide records whose market was inferred from the search rather than "
+                 "named in the article.",
+        )
+        only_verified = bottom[3].toggle(
+            "Companies House verified", value=False,
+            help="Only people matched to a filed officer or PSC record.",
+        )
+
+    view = frame.copy()
+    if search:
+        needle = search.lower()
+        haystacks = ["full_name", "company", "locality", "market_name", "address",
+                     "ch_company_name", "ch_registered_office"]
+        mask = pd.Series(False, index=view.index)
+        for column in haystacks:
+            if column in view.columns:
+                mask |= view[column].fillna("").astype(str).str.lower().str.contains(
+                    needle, regex=False
+                )
+        view = view[mask]
+    if countries:
+        view = view[view["country"].isin(countries)]
+    if groups:
+        view = view[view["market_group"].isin(groups)]
+    if markets:
+        view = view[view["market_name"].isin(markets)]
+    if bands:
+        view = view[view["wealth_band"].isin(bands)]
+    if cohorts:
+        view = view[view["cohort"].isin(cohorts)]
+    if found_via:
+        view = view[view["primary_event"].isin(found_via)]
+    view = view[view["confidence"] >= min_confidence]
+    if only_estimated:
+        view = view[view["investable_mid_gbp"].notna()]
+    if only_located:
+        view = view[view["market_source"] == "text"]
+    if only_verified:
+        view = view[view["ch_officer_name"].notna()]
+
+    column, ascending = SORTS[sort_label]
+    return view.sort_values(column, ascending=ascending, na_position="last")
+
+
+def page_list(frame: pd.DataFrame) -> None:
+    st.title("Prospect list")
+    if frame.empty:
+        st.info("Nothing here yet. Run a search from **Find prospects** in the sidebar.")
+        return
+
+    view = _filters(frame)
+    st.caption(f"Showing **{len(view)}** of {len(frame)} people on file.")
+    if view.empty:
+        st.warning("No one matches those filters.")
+        return
+
+    sources = load_sources_index()
+
+    def first_source(prospect_id: int, field: str) -> str:
+        rows = sources.get(int(prospect_id), [])
+        return str(rows[0].get(field) or "") if rows else ""
+
+    # Deliberately few columns. Country is already inside "Where", and the date
+    # found, the citation count and the full history live on the record — a table
+    # you have to scroll sideways to read is not an easier table.
+    table = pd.DataFrame({
+        "Name": view["full_name"],
+        "Role": view["job_title"].fillna(""),
+        "Company": view["company"].fillna(""),
+        "Where": view.apply(where_text, axis=1),
+        "Est. investable £": view["investable_mid_gbp"],
+        "Band": view["wealth_band"],
+        "Confidence": view["confidence"],
+        "Found via": view["primary_event"].fillna(""),
+        "Verified": view["ch_officer_name"].notna(),
+        "Located": view["market_source"] == "text",
+        "Status": view["status"],
+        "Source": view["id"].map(lambda i: first_source(i, "url")),
+    }).reset_index(drop=True)
+
+    selection = st.dataframe(
+        table,
+        hide_index=True,
+        width="stretch",
+        height=min(520, 60 + 36 * len(table)),
+        on_select="rerun",
+        selection_mode="single-row",
+        column_config={
+            "Name": st.column_config.TextColumn(pinned=True, width="medium"),
+            "Role": st.column_config.TextColumn(width="small"),
+            "Where": st.column_config.TextColumn(width="medium"),
+            "Est. investable £": st.column_config.NumberColumn(
+                "Est. investable £",
+                format="compact",
+                help="Modelled estimate of investable assets, in GBP. Blank means the app "
+                     "declined to put a figure on the evidence — never that it is zero.",
+            ),
+            "Band": st.column_config.TextColumn(width="small"),
+            "Confidence": st.column_config.ProgressColumn(
+                "Confidence", min_value=0, max_value=100, format="%d", width="small",
+                help="How well evidenced the record is — a separate question from how "
+                     "wealthy the person is.",
+            ),
+            "Verified": st.column_config.CheckboxColumn(
+                "CH ✓", help="Matched to a filed Companies House officer or PSC record.",
+            ),
+            "Located": st.column_config.CheckboxColumn(
+                "Located",
+                help="Ticked when the article named the place. Unticked means the market "
+                     "was inferred from the search that found it.",
+            ),
+            "Status": st.column_config.TextColumn(width="small"),
+            "Source": st.column_config.LinkColumn(
+                "Article", display_text="open", width="small",
+                help="The first source on the record.",
+            ),
+        },
+    )
+    st.caption(
+        "Click the box at the start of a row to open that person's full record below — "
+        "the figure, how it was reached, every source, and what to do next. Click any "
+        "column heading to sort by it."
+    )
+
+    estimate_disclaimer()
+    st.download_button(
+        "Download this list as CSV",
+        data=(
+            "# All monetary figures are MODELLED ESTIMATES from public reporting, "
+            "not verified statements of wealth.\n"
+            + view.drop(columns=["lat", "lon"], errors="ignore").to_csv(index=False)
+        ),
+        file_name=f"prospects-{datetime.now(timezone.utc):%Y-%m-%d}.csv",
+        mime="text/csv",
+    )
+
+    rows = list(getattr(selection, "selection", {}).get("rows", []) or [])
+    st.divider()
+    if not rows:
+        return
+
+    row = view.iloc[rows[0]]
+    render_prospect_detail(row)
+
+
+# ---------------------------------------------------------------------------
+# The record
+# ---------------------------------------------------------------------------
 
 
 def render_prospect_detail(row: pd.Series) -> None:
     """Everything behind one prospect: the figure, its basis, and its evidence."""
-    left, right = st.columns([1.45, 1])
+    heading = str(row["full_name"])
+    if present(row, "job_title"):
+        heading += f", {row['job_title']}"
+    if present(row, "company"):
+        heading += f" · {row['company']}"
+    st.subheader(heading)
+    st.markdown(
+        confidence_pill(int(row["confidence"]), str(row["confidence_band"]))
+        + f'<span class="pill pill-none">{row["cohort"]}</span>'
+        + f'<span class="pill pill-none">{row["wealth_band"]}</span>'
+        + (f'<span class="pill pill-good">Companies House ✓</span>'
+           if present(row, "ch_officer_name") else ""),
+        unsafe_allow_html=True,
+    )
+
+    left, right = st.columns([1.5, 1])
 
     with left:
         if present(row, "investable_mid_gbp"):
@@ -165,8 +716,9 @@ def render_prospect_detail(row: pd.Series) -> None:
                 help="Modelled from reported figures. Not a verified amount.",
             )
             st.caption(
-                f"Range {fmt_gbp(row['investable_low_gbp'])} – {fmt_gbp(row['investable_high_gbp'])}"
-                f" · gross estimated wealth {fmt_gbp(row['gross_mid_gbp'])}"
+                f"Range {fmt_gbp(row['investable_low_gbp'])} – "
+                f"{fmt_gbp(row['investable_high_gbp'])} · gross estimated wealth "
+                f"{fmt_gbp(row['gross_mid_gbp'])}"
             )
             st.markdown(
                 f'<div class="reason"><strong>How that figure was reached:</strong> '
@@ -176,8 +728,10 @@ def render_prospect_detail(row: pd.Series) -> None:
         else:
             st.markdown("**Estimated investable assets:** _not estimated_")
             st.markdown(
-                f'<div class="reason"><strong>Why not:</strong> '
-                f'{row["not_estimated_reason"] if present(row, "not_estimated_reason") else "No basis for an estimate was found."}</div>',
+                '<div class="reason"><strong>Why not:</strong> '
+                + (str(row["not_estimated_reason"]) if present(row, "not_estimated_reason")
+                   else "No basis for an estimate was found.")
+                + "</div>",
                 unsafe_allow_html=True,
             )
 
@@ -192,7 +746,7 @@ def render_prospect_detail(row: pd.Series) -> None:
             st.markdown(f'<div class="reason">{row["rationale"]}</div>', unsafe_allow_html=True)
 
         st.markdown("**Sources**")
-        for source in sources_for(int(row["id"])):
+        for source in load_sources_index().get(int(row["id"]), []):
             published = (source.get("published_at") or "")[:10]
             st.markdown(
                 f"- [{source['title']}]({source['url']}) — "
@@ -203,12 +757,38 @@ def render_prospect_detail(row: pd.Series) -> None:
             if source.get("rationale"):
                 st.caption(source["rationale"])
 
+        history = events_for(int(row["id"]))
+        if history:
+            with st.expander(f"Record history ({len(history)} entries)"):
+                for entry in history:
+                    st.markdown(
+                        f"**{entry['created_at'][:10]}** · {entry['kind']} — {entry['message']}"
+                    )
+
     with right:
-        st.markdown("**Confidence**")
-        st.markdown(
-            confidence_pill(int(row["confidence"]), str(row["confidence_band"])),
-            unsafe_allow_html=True,
+        st.markdown("**Where they are**")
+        st.markdown(f'<div class="reason">{where_text(row)}</div>', unsafe_allow_html=True)
+        if row.get("market_source") != "text":
+            st.caption(
+                "The article does not name a place. This market comes from the search "
+                "that found the story — confirm it before acting on the record."
+            )
+        elif present(row, "matched_place"):
+            st.caption(f"Located from “{row['matched_place']}” in the source text.")
+
+        address = (
+            row["ch_registered_office"] if present(row, "ch_registered_office")
+            else row["address"] if present(row, "address") else None
         )
+        if address:
+            st.markdown("**Registered office**")
+            st.markdown(f'<div class="reason">{address}</div>', unsafe_allow_html=True)
+            st.caption(
+                "The company's filed address from Companies House. Not a home address, "
+                "and it must not be treated as one."
+            )
+
+        st.markdown("**Confidence**")
         detail = json.loads(row["confidence_detail"]) if present(row, "confidence_detail") else []
         for dimension in detail:
             st.progress(
@@ -226,112 +806,105 @@ def render_prospect_detail(row: pd.Series) -> None:
                 f"Shareholding filed at {row['ch_ownership_band']} on the Companies "
                 f"House PSC register — this stake is a fact, not an assumption."
             )
+        elif present(row, "ch_officer_name"):
+            st.warning(
+                f"Confirmed as a filed officer ({row['ch_officer_name']}), but no "
+                f"shareholding is on the PSC register. The stake behind any figure "
+                f"above remains assumed."
+            )
         elif present(row, "ch_company_number"):
             st.warning(
                 f"Company matched on the register ({row['ch_company_number']}), but the "
-                f"individual's shareholding is not filed. The stake remains assumed."
+                f"individual does not appear in its filings. The stake remains assumed."
             )
         else:
             st.warning(
-                "Not verified against Companies House. The shareholding behind any "
+                "Not verified against a company register. The shareholding behind any "
                 "figure above is an assumption."
             )
 
         search_name = str(row["full_name"]).replace(" ", "+")
-        st.markdown(
-            "**Check it yourself**  \n"
+        links = [
             f"- [Companies House officer search]"
-            f"(https://find-and-update.company-information.service.gov.uk/search/officers?q={search_name})  \n"
-            f"- [LinkedIn search](https://www.linkedin.com/search/results/people/?keywords={search_name}) "
-            "— manual only; this app never scrapes LinkedIn."
+            f"(https://find-and-update.company-information.service.gov.uk/search/officers?q={search_name})",
+            f"- [News search](https://news.google.com/search?q=%22{search_name}%22)",
+            f"- [LinkedIn search](https://www.linkedin.com/search/results/people/?keywords={search_name})"
+            " — manual only; this app never scrapes LinkedIn.",
+        ]
+        if present(row, "ch_profile_url"):
+            links.insert(0, f"- [Companies House company record]({row['ch_profile_url']})")
+        st.markdown("**Check it yourself**  \n" + "  \n".join(links))
+
+    st.divider()
+    _pipeline_controls(row)
+
+
+def _pipeline_controls(row: pd.Series) -> None:
+    """The advisor's own notes. Kept separate from everything the pipeline derives."""
+    st.markdown("**Your pipeline notes**")
+    with st.form(f"pipeline_{int(row['id'])}"):
+        columns = st.columns([1, 1, 1])
+        statuses = ["New", "Researching", "Qualified", "Contacted", "In conversation",
+                    "Client", "Not a fit", "Parked"]
+        stages = ["Unaware", "Aware", "Engaged", "In discussion", "Proposal", "Onboarded"]
+        current_status = str(row["status"]) if present(row, "status") else "New"
+        current_stage = (
+            str(row["relationship_stage"]) if present(row, "relationship_stage") else "Unaware"
         )
-
-
-# ---------------------------------------------------------------------------
-# Pages
-# ---------------------------------------------------------------------------
-
-
-#: The four events where money has genuinely changed hands. A first sweep uses
-#: only these, because they are the highest-yield patterns and 52 searches
-#: complete in about a minute rather than three.
-QUICK_EVENTS = ["business_exit", "acquisition", "management_buyout", "windfall"]
-
-
-def run_quick_sweep() -> None:
-    """A fast, high-yield first run, so a fresh install shows something quickly."""
-    status = st.status("Searching live news…", expanded=True)
-    bar = st.progress(0.0)
-
-    def report(message: str, fraction: float) -> None:
-        status.update(label=message)
-        bar.progress(min(1.0, fraction))
-
-    result = run_research(
-        trigger="quick-start",
-        days=30,
-        event_keys=QUICK_EVENTS,
-        include_publishers=False,
-        verify_companies_house=companies_house_available(),
-        progress=report,
-    )
-    status.update(label=f"Finished — {result.status}", state="complete")
-
-    if result.new_prospects:
-        generate_and_store()
-    refresh()
-
-    columns = st.columns(4)
-    columns[0].metric("Searches", result.queries_run)
-    columns[1].metric("Articles read", result.articles_seen)
-    columns[2].metric("Events kept", result.events_kept)
-    columns[3].metric("New prospects", result.new_prospects)
-
-    if result.new_prospects:
-        st.success(
-            f"Found {result.new_prospects} prospect(s). Reload the page, or open "
-            f"**Prospects** in the sidebar."
+        status = columns[0].selectbox(
+            "Lead status", statuses,
+            index=statuses.index(current_status) if current_status in statuses else 0,
         )
-    else:
-        st.warning(
-            "No prospects met the criteria in that window. That is a normal outcome "
-            "for a narrow first sweep — try **Run research** with all 14 event types "
-            "and a 30-day window, and include the regional publisher feeds."
+        stage = columns[1].selectbox(
+            "Relationship stage", stages,
+            index=stages.index(current_stage) if current_stage in stages else 0,
         )
+        owner = columns[2].text_input(
+            "Owner", value=str(row["owner"]) if present(row, "owner") else "",
+        )
+        notes = st.text_area(
+            "Notes", value=str(row["notes"]) if present(row, "notes") else "", height=90,
+        )
+        if st.form_submit_button("Save", type="primary"):
+            with db.connect() as conn:
+                db.update_prospect(conn, int(row["id"]), {
+                    "status": status, "relationship_stage": stage,
+                    "owner": owner, "notes": notes,
+                })
+            refresh()
+            st.success("Saved.")
 
-    if result.warnings:
-        with st.expander(f"{len(result.warnings)} source(s) could not be read"):
-            for warning in result.warnings:
-                st.text(warning)
+    with st.expander("Remove this person from the list (data protection)"):
         st.caption(
-            "Some publishers block automated readers. A blocked feed simply means "
-            "that source contributed nothing this run."
+            "Use this when someone objects to being profiled. The record is suppressed "
+            "rather than deleted, so the weekly sweep cannot find them again and "
+            "recreate them, and they are excluded from every total and report."
         )
+        reason = st.text_input("Reason", key=f"suppress_reason_{int(row['id'])}")
+        if st.button("Suppress this record", key=f"suppress_{int(row['id'])}"):
+            with db.connect() as conn:
+                db.suppress_prospect(conn, int(row["id"]), reason or "No reason recorded")
+            refresh()
+            st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# Page: overview
+# ---------------------------------------------------------------------------
 
 
 def page_overview(frame: pd.DataFrame) -> None:
     st.title("Overview")
     st.caption(
-        "People in the 13 target counties who appear to have recently come into "
-        "significant wealth, found by searching public news each week."
+        "People who appear to have recently come into significant wealth, found by "
+        "searching public news across the markets you selected."
     )
 
     if frame.empty:
         st.info(
-            "**No prospects yet.** The button below runs a first sweep against live "
-            "news — the four event types where money has actually changed hands "
-            "(business sold, acquired, management buyout, windfall) across all 13 "
-            "counties, looking back 30 days. That is 52 searches and takes about a "
-            "minute."
-        )
-        if st.button("Run a quick first sweep", type="primary"):
-            run_quick_sweep()
-            return
-        st.caption(
-            "For the full sweep — all 14 event types, 182 searches — use **Run "
-            "research** in the sidebar. To see how the dashboard looks before "
-            "running anything live, load the fictional demo data with "
-            "`python scripts/seed_demo.py`."
+            "**Nothing on file yet.** Open **Find prospects** in the sidebar and press "
+            "*Start searching* — the default settings sweep the UK, the United States "
+            "and the Middle East."
         )
         return
 
@@ -344,199 +917,149 @@ def page_overview(frame: pd.DataFrame) -> None:
     unestimated = frame[frame["investable_mid_gbp"].isna()]
 
     columns = st.columns(6)
-    columns[0].metric("Tracked", len(frame))
+    columns[0].metric("On file", len(frame))
     columns[1].metric("New this week", len(this_week))
     columns[2].metric("Qualifying", len(qualifying), help="£7.5m+ estimated investable assets")
     columns[3].metric("Pre-liquidity", len(pre_liquidity), help="£15m+ gross, not yet liquid")
     columns[4].metric("Addressable", fmt_gbp(qualifying["investable_mid_gbp"].sum()))
-    columns[5].metric("High confidence", int((frame["confidence"] >= 68).sum()))
+    columns[5].metric("Verified", int(frame["ch_officer_name"].notna().sum()),
+                      help="Matched to a filed Companies House record")
     estimate_disclaimer()
 
     if len(unestimated):
         st.caption(
-            f"**{len(unestimated)} prospect(s) carry no monetary figure.** That is "
-            "deliberate: the evidence found indicates wealth without sizing it, and "
-            "the app states the reason on each record rather than inventing a number."
+            f"**{len(unestimated)} of these carry no monetary figure.** That is deliberate: "
+            "the evidence found indicates wealth without sizing it, and each record states "
+            "the reason rather than inventing a number."
         )
 
     st.divider()
-    left, right = st.columns([1.15, 1])
+    left, right = st.columns([1.2, 1])
 
     with left:
-        st.subheader("Estimated addressable assets by county")
-        by_region = (
+        st.subheader("Estimated addressable assets by market")
+        by_market = (
             frame.assign(investable=frame["investable_mid_gbp"].fillna(0))
-            .groupby("region", as_index=False)
+            .groupby(["market_name", "country"], as_index=False)
             .agg(prospects=("id", "count"), addressable=("investable", "sum"))
             .sort_values("addressable", ascending=False)
+            .head(25)
         )
         chart = (
-            alt.Chart(by_region)
+            alt.Chart(by_market)
             .mark_bar(color=ACCENT, cornerRadiusEnd=3)
             .encode(
                 x=alt.X("addressable:Q", title="Estimated addressable (£)"),
-                # labelOverlap=False forces every county to keep its label;
+                # labelOverlap=False forces every market to keep its label;
                 # Altair otherwise drops alternates and the chart becomes unreadable.
-                y=alt.Y("region:N", sort="-x", title=None,
-                        axis=alt.Axis(labelOverlap=False, labelLimit=160)),
+                y=alt.Y("market_name:N", sort="-x", title=None,
+                        axis=alt.Axis(labelOverlap=False, labelLimit=190)),
                 tooltip=[
-                    alt.Tooltip("region:N", title="County"),
-                    alt.Tooltip("prospects:Q", title="Prospects"),
+                    alt.Tooltip("market_name:N", title="Market"),
+                    alt.Tooltip("country:N", title="Country"),
+                    alt.Tooltip("prospects:Q", title="People"),
                     alt.Tooltip("addressable:Q", title="Addressable (£)", format=","),
                 ],
             )
-            .properties(height=max(240, 26 * len(by_region)))
+            .properties(height=max(240, 24 * len(by_market)))
         )
         st.altair_chart(chart, width="stretch")
 
     with right:
-        st.subheader("Wealth bands")
-        bands = (
-            frame.groupby("wealth_band", as_index=False)
-            .agg(prospects=("id", "count"))
+        st.subheader("By country")
+        by_country = (
+            frame.assign(investable=frame["investable_mid_gbp"].fillna(0))
+            .groupby("country", as_index=False)
+            .agg(people=("id", "count"), addressable=("investable", "sum"))
+            .sort_values("people", ascending=False)
         )
+        st.dataframe(
+            by_country.rename(columns={
+                "country": "Country", "people": "People", "addressable": "Addressable (£)",
+            }),
+            hide_index=True, width="stretch",
+            column_config={
+                "Addressable (£)": st.column_config.NumberColumn(format="compact"),
+            },
+        )
+
+        st.subheader("Wealth bands")
+        bands = frame.groupby("wealth_band", as_index=False).agg(people=("id", "count"))
         band_chart = (
             alt.Chart(bands)
             .mark_bar(color=ACCENT, cornerRadiusEnd=3)
             .encode(
                 x=alt.X("wealth_band:N", sort=BAND_ORDER, title=None,
                         axis=alt.Axis(labelAngle=-35)),
-                y=alt.Y("prospects:Q", title="Prospects"),
-                tooltip=["wealth_band:N", "prospects:Q"],
+                y=alt.Y("people:Q", title="People"),
+                tooltip=["wealth_band:N", "people:Q"],
             )
-            .properties(height=250)
+            .properties(height=230)
         )
         st.altair_chart(band_chart, width="stretch")
 
+    st.divider()
+    map_column, event_column = st.columns([1.4, 1])
+    with map_column:
+        st.subheader("Where they are")
+        located = frame.dropna(subset=["lat", "lon"])
+        if located.empty:
+            st.caption("No prospects with a resolved market yet.")
+        else:
+            try:
+                st.map(located[["lat", "lon"]], size=24000, color="#0f766e")
+                st.caption(
+                    "Plotted at the centre of each market. Sources give a town or a "
+                    "county, not a street address."
+                )
+            except Exception:
+                # Map tiles come from an external host; on a locked-down network the
+                # table is a perfectly good substitute and must not break the page.
+                st.caption("Map tiles unavailable on this network — showing counts instead.")
+                st.dataframe(
+                    located.groupby("market_name", as_index=False)
+                    .agg(people=("id", "count"))
+                    .rename(columns={"market_name": "Market", "people": "People"}),
+                    hide_index=True, width="stretch",
+                )
+    with event_column:
         st.subheader("How they were found")
-        events = frame.groupby("primary_event", as_index=False).agg(n=("id", "count"))
+        events = (
+            frame.groupby("primary_event", as_index=False)
+            .agg(people=("id", "count"))
+            .sort_values("people", ascending=False)
+        )
         st.dataframe(
-            events.rename(columns={"primary_event": "Wealth event", "n": "Prospects"}),
+            events.rename(columns={"primary_event": "Wealth event", "people": "People"}),
             hide_index=True, width="stretch",
         )
 
     st.divider()
-    st.subheader("Where they are")
-    located = frame.dropna(subset=["lat", "lon"])
-    if located.empty:
-        st.caption("No prospects with a resolved county yet.")
-    else:
-        try:
-            st.map(located[["lat", "lon"]], size=12000, color="#0f766e")
-            st.caption(
-                "Plotted at county centre — the sources give a county, not a street address."
-            )
-        except Exception:
-            # Map tiles come from an external host; on a locked-down network the
-            # table is a perfectly good substitute and must not break the page.
-            st.caption("Map tiles unavailable on this network — showing counts instead.")
-            st.dataframe(
-                located.groupby("region", as_index=False)
-                .agg(prospects=("id", "count"))
-                .rename(columns={"region": "County", "prospects": "Prospects"}),
-                hide_index=True, width="stretch",
-            )
-
-    st.divider()
     st.subheader("Highest estimated investable assets")
-    ranked = frame.sort_values("investable_mid_gbp", ascending=False, na_position="last").head(15)
+    ranked = frame.sort_values("investable_mid_gbp", ascending=False, na_position="last").head(20)
     st.dataframe(
         pd.DataFrame({
             "Name": ranked["full_name"],
             "Company": ranked["company"].fillna("—"),
-            "County": ranked["region"],
+            "Where": ranked.apply(where_text, axis=1),
             "Found via": ranked["primary_event"].fillna("—"),
-            "Est. investable": ranked["investable_mid_gbp"].map(fmt_gbp),
+            "Est. investable": ranked["investable_mid_gbp"],
             "Band": ranked["wealth_band"],
             "Confidence": ranked["confidence"],
-            "Cohort": ranked["cohort"],
         }),
         hide_index=True, width="stretch",
+        column_config={
+            "Est. investable": st.column_config.NumberColumn(format="compact"),
+            "Confidence": st.column_config.ProgressColumn(
+                min_value=0, max_value=100, format="%d"
+            ),
+        },
     )
 
 
-def page_prospects(frame: pd.DataFrame) -> None:
-    st.title("Prospects")
-    if frame.empty:
-        st.info("No prospects yet. Run a research sweep from the sidebar.")
-        return
-
-    with st.container(border=True):
-        row1 = st.columns([2, 1.3, 1.3])
-        search = row1[0].text_input("Search", placeholder="Name, company or town")
-        cohorts = row1[1].multiselect("Cohort", sorted(frame["cohort"].dropna().unique()))
-        min_confidence = row1[2].slider("Minimum confidence", 0, 100, 0, step=5)
-
-        row2 = st.columns([1.6, 1.6, 1.2])
-        regions = row2[0].multiselect("County", [r for r in REGIONS if r in set(frame["region"])])
-        bands = row2[1].multiselect(
-            "Wealth band",
-            [b for b in BAND_ORDER if b in set(frame["wealth_band"])],
-        )
-        sort_by = row2[2].selectbox(
-            "Sort by",
-            ["Estimated wealth", "Confidence", "Newest", "Name"],
-        )
-
-    view = frame.copy()
-    if search:
-        needle = search.lower()
-        view = view[
-            view["full_name"].str.lower().str.contains(needle, na=False)
-            | view["company"].fillna("").str.lower().str.contains(needle, na=False)
-            | view["matched_place"].fillna("").str.lower().str.contains(needle, na=False)
-        ]
-    if cohorts:
-        view = view[view["cohort"].isin(cohorts)]
-    if regions:
-        view = view[view["region"].isin(regions)]
-    if bands:
-        view = view[view["wealth_band"].isin(bands)]
-    view = view[view["confidence"] >= min_confidence]
-
-    if sort_by == "Estimated wealth":
-        view = view.sort_values("investable_mid_gbp", ascending=False, na_position="last")
-    elif sort_by == "Confidence":
-        view = view.sort_values("confidence", ascending=False)
-    elif sort_by == "Newest":
-        view = view.sort_values("first_seen", ascending=False)
-    else:
-        view = view.sort_values("full_name")
-
-    st.caption(f"{len(view)} of {len(frame)} prospects")
-    estimate_disclaimer()
-
-    st.download_button(
-        "Download this view as CSV",
-        data=(
-            "# All monetary figures are MODELLED ESTIMATES from public reporting, "
-            "not verified statements of wealth.\n"
-            + view.drop(columns=["lat", "lon"], errors="ignore").to_csv(index=False)
-        ),
-        file_name=f"prospects-{datetime.now(timezone.utc):%Y-%m-%d}.csv",
-        mime="text/csv",
-    )
-
-    for _, row in view.iterrows():
-        verified = " ✓ filed stake" if present(row, "ch_ownership_band") else ""
-        amount = (
-            fmt_gbp(row["investable_mid_gbp"]) if present(row, "investable_mid_gbp")
-            else "not estimated"
-        )
-        headline = (
-            f"**{row['full_name']}**"
-            f" · {row['region']}"
-            f" · {amount}"
-            f" · confidence {row['confidence']}{verified}"
-        )
-        with st.expander(headline):
-            meta = " · ".join(
-                str(row[key]) for key in ("job_title", "company", "primary_event")
-                if present(row, key)
-            )
-            if meta:
-                st.caption(meta)
-            render_prospect_detail(row)
+# ---------------------------------------------------------------------------
+# Page: weekly report
+# ---------------------------------------------------------------------------
 
 
 def page_research_doc() -> None:
@@ -582,152 +1105,17 @@ def page_research_doc() -> None:
     st.markdown(markdown)
 
 
-def page_run_research() -> None:
-    st.title("Run research")
-    st.caption(
-        "Crosses 14 wealth-event patterns with the 13 target counties and searches "
-        "public news for each. Safe to run repeatedly — articles already processed "
-        "are skipped."
-    )
-
-    with db.connect() as conn:
-        due = db.run_due_this_week(conn)
-        latest = db.last_run(conn)
-
-    if due:
-        st.warning(
-            f"**No sweep has run yet in {db.iso_week()}.** The intended cadence is once "
-            "at the start of each week."
-        )
-    else:
-        st.success(f"A sweep has already run this week ({db.iso_week()}).")
-
-    with st.container(border=True):
-        columns = st.columns([1, 1, 1])
-        days = columns[0].slider("Look back (days)", 2, 30, 7,
-                                 help="7 days matches a weekly cadence. Use 30 for a first run.")
-        selected_regions = columns[1].multiselect(
-            "Counties (all if empty)", list(REGIONS), default=[],
-        )
-        selected_events = columns[2].multiselect(
-            "Wealth events (all if empty)",
-            [t.key for t in EVENT_TEMPLATES],
-            format_func=lambda k: next(t.label for t in EVENT_TEMPLATES if t.key == k),
-            default=[],
-        )
-
-        options = st.columns([1, 1, 1])
-        include_publishers = options[0].checkbox("Also sweep regional publishers", value=True)
-        verify_ch = options[1].checkbox(
-            "Verify with Companies House",
-            value=companies_house_available(),
-            disabled=not companies_house_available(),
-            help="Turns an assumed shareholding into a filed one. Needs COMPANIES_HOUSE_API_KEY.",
-        )
-        cap = options[2].number_input(
-            "Cap queries (0 = no cap)", min_value=0, max_value=400, value=0, step=10,
-            help="Useful for a quick test run.",
-        )
-
-    if not companies_house_available():
-        st.caption(
-            "Companies House verification is off because no API key is set. It is a "
-            "**bonus**, not a requirement — without it, shareholdings stay labelled as "
-            "assumptions and confidence scores stay correspondingly lower. Set "
-            "`COMPANIES_HOUSE_API_KEY` in your environment to enable it."
-        )
-
-    quick, full = st.columns([1, 1])
-    if quick.button("Quick sweep (52 searches, ~1 min)"):
-        run_quick_sweep()
-        return
-
-    if full.button("Start research sweep", type="primary"):
-        status = st.status("Starting…", expanded=True)
-        bar = st.progress(0.0)
-
-        def report_progress(message: str, fraction: float) -> None:
-            status.update(label=message)
-            bar.progress(min(1.0, fraction))
-
-        result = run_research(
-            trigger="manual",
-            days=days,
-            regions=selected_regions or None,
-            event_keys=selected_events or None,
-            include_publishers=include_publishers,
-            verify_companies_house=verify_ch,
-            max_queries=int(cap) or None,
-            progress=report_progress,
-        )
-        status.update(label=f"Finished — {result.status}", state="complete")
-        refresh()
-
-        metrics = st.columns(5)
-        metrics[0].metric("Searches", result.queries_run)
-        metrics[1].metric("Articles read", result.articles_seen)
-        metrics[2].metric("Events kept", result.events_kept)
-        metrics[3].metric("New prospects", result.new_prospects)
-        metrics[4].metric("Corroborated", result.updated_prospects)
-
-        if result.company_leads:
-            st.caption(
-                f"{result.company_leads} event(s) named a company but no individual. "
-                "Those are not turned into prospects — inventing a name would be worse "
-                "than useless — but they appear in the run log for manual follow-up."
-            )
-
-        if result.new_prospects or result.updated_prospects:
-            with st.spinner("Updating the weekly research document…"):
-                generate_and_store()
-            refresh()
-            st.success("Research document updated. See **Weekly research document**.")
-
-        if result.log:
-            with st.expander(f"Run log ({len(result.log)} entries)"):
-                for line in result.log:
-                    st.text(line)
-        if result.warnings:
-            with st.expander(f"Warnings ({len(result.warnings)})"):
-                for warning in result.warnings:
-                    st.text(warning)
-            st.caption(
-                "Warnings are normal: some publishers block automated readers, and a "
-                "blocked feed simply means that source contributed nothing this run."
-            )
-
-    st.divider()
-    st.subheader("Run history")
-    runs = load_runs()
-    if not runs:
-        st.caption("No runs recorded yet.")
-    else:
-        st.dataframe(
-            pd.DataFrame([{
-                "Started": r["started_at"][:16].replace("T", " "),
-                "Week": r["week"],
-                "Trigger": r["trigger"],
-                "Status": r["status"],
-                "Searches": r["queries_run"],
-                "Articles": r["articles_seen"],
-                "Kept": r["events_kept"],
-                "New": r["new_prospects"],
-                "Warnings": len(json.loads(r["warnings"] or "[]")),
-            } for r in runs]),
-            hide_index=True, width="stretch",
-        )
-
-    if latest:
-        st.caption(
-            "To automate this weekly, schedule `python scripts/run_research.py` for "
-            "Monday morning — cron on macOS/Linux, Task Scheduler on Windows. See the "
-            "Methodology page."
-        )
+# ---------------------------------------------------------------------------
+# Page: how it works
+# ---------------------------------------------------------------------------
 
 
 def page_methodology() -> None:
-    st.title("Methodology")
-    st.caption(f"Research model v{MODEL_VERSION}. How every figure is produced, and where it can be wrong.")
+    st.title("How it works")
+    st.caption(
+        f"Research model v{MODEL_VERSION}. How every figure is produced, and where it "
+        f"can be wrong."
+    )
 
     st.error(
         "**Every monetary figure in this app is an estimate, not a fact.** It tells you "
@@ -736,23 +1124,56 @@ def page_methodology() -> None:
         "sources and check them."
     )
 
-    st.subheader("What the app does each week")
+    st.subheader("What a sweep actually does")
     st.markdown(
         """
-1. **Searches.** 14 wealth-event patterns crossed with 13 counties — 182 targeted
-   news queries, plus a broad sweep of regional business publishers.
-2. **Filters by geography.** A record whose location cannot be resolved to one of
-   the 13 counties is discarded, never defaulted. Ambiguous place names ("Bath",
-   "Reading", "Chelsea") are only accepted when the county name corroborates them.
-3. **Extracts the event.** Transaction values, named individuals and their roles,
-   and the company. The extractor prefers finding nothing to guessing — a false
-   name here becomes a wrong claim about a real person.
-4. **Estimates, or declines to.** Where a figure can be derived, the arithmetic is
+1. **Builds the searches.** Each of the 14 wealth events is crossed with every
+   selected market. Town names are folded into each query with `OR`, so an article
+   that only says "Newton Abbot" is still found by a Devon search — without needing
+   a separate request per town.
+2. **Reads publisher feeds.** Google News RSS plus a fixed list of UK regional, US
+   and Gulf business publishers. Feeds only: no article bodies are scraped and no
+   paywall is circumvented.
+3. **Locates each article.** Geography is resolved against all 70 markets and then
+   checked against your selection. An article that positively names somewhere out of
+   scope is discarded. An article that names nowhere at all inherits the market from
+   the search that found it — flagged as *inferred*, and scored lower for it.
+4. **Extracts the event.** Transaction values in ~25 currencies, named individuals
+   and their roles, and the company. The extractor prefers finding nothing to
+   guessing: a false name here becomes a wrong claim about a real person.
+5. **Estimates, or declines to.** Where a figure can be derived, the arithmetic is
    recorded in plain English. Where it cannot, the app says why and stores no number.
-5. **Scores confidence** across five dimensions, and states the single best action
-   to raise it.
-6. **Writes the research document** for the week.
+6. **Verifies, if it can.** UK companies are checked against Companies House: the PSC
+   register replaces the assumed shareholding with a filed band, the officers list
+   confirms the person, and the profile supplies the registered office address.
+7. **Scores confidence** across six dimensions, and states the single best action to
+   raise it.
         """
+    )
+
+    st.subheader("Search depths")
+    st.dataframe(
+        pd.DataFrame([{
+            "Depth": d.label,
+            "Events": len(d.event_keys) or len(EVENT_TEMPLATES),
+            "Towns per market": d.places or "market name only",
+            "Windows": ", ".join(f"{w}d" for w in d.windows),
+            "What it is for": d.description,
+        } for d in DEPTHS]),
+        hide_index=True, width="stretch",
+    )
+
+    st.subheader("Where it looks")
+    st.dataframe(
+        pd.DataFrame([{
+            "Market": m.name, "Region": m.group, "Country": m.country,
+            "Currency": m.currency, "Places recognised": len(m.places),
+        } for m in ALL_MARKETS]),
+        hide_index=True, width="stretch", height=320,
+    )
+    st.caption(
+        f"{len(ALL_MARKETS)} markets in {len(GROUP_ORDER)} regions. The presets in "
+        f"**Find prospects** are just saved selections of these."
     )
 
     st.subheader("Wealth events searched")
@@ -796,6 +1217,46 @@ def page_methodology() -> None:
         """
     )
 
+    st.subheader("Connecting Companies House")
+    if not companies_house_available():
+        st.markdown(
+            """
+Optional, and free. It is the one source that can turn an assumed shareholding into a
+filed fact, and the only one that supplies a real address.
+
+1. Register at **developer.company-information.service.gov.uk** and create an
+   application.
+2. Create a **REST API key** for the *live* environment. A streaming key or a
+   test-sandbox key will be rejected.
+3. Set it as an environment variable before starting the app:
+
+   ```bash
+   export COMPANIES_HOUSE_API_KEY="your-key-here"
+   streamlit run streamlit_app.py
+   ```
+
+   On Streamlit Community Cloud, put it in **Settings → Secrets** instead:
+
+   ```toml
+   COMPANIES_HOUSE_API_KEY = "your-key-here"
+   ```
+
+Never paste the key into a file you commit, and never into a chat window. If a key has
+been shared anywhere, revoke it in the developer portal and issue a new one.
+            """
+        )
+    else:
+        if st.button("Test the connection"):
+            with st.spinner("Asking the register…"):
+                ok, message = companies_house_status()
+            (st.success if ok else st.error)(message)
+        st.caption(
+            "A key is configured. It is only ever used for UK companies — running a "
+            "Dubai or Texas business through a British register would either find "
+            "nothing or, worse, find a same-named British company and attach the wrong "
+            "number to a real person."
+        )
+
     st.subheader("Sources, and lawful use")
     st.markdown(
         """
@@ -803,7 +1264,7 @@ Only publicly available, lawfully obtainable information is used.
 
 - **Google News RSS** — the discovery engine. Publisher-provided feeds only; no
   article bodies are scraped and no paywalls circumvented.
-- **Regional business publishers** — RSS feeds, read the same way.
+- **Business publishers** — RSS feeds, read the same way.
 - **Companies House** — optional. The one source that can turn an assumed
   shareholding into a filed fact, published under the Open Government Licence v3.0.
 - **LinkedIn** — never automated. Its User Agreement prohibits scraping, so the app
@@ -816,11 +1277,11 @@ can see and block it if they wish.
 
     st.subheader("Automating the weekly run")
     st.code(
-        "# macOS / Linux — 07:00 every Monday\n"
-        "0 7 * * 1 cd /path/to/ca_dashboard && "
-        "/usr/bin/python3 scripts/run_research.py >> research.log 2>&1\n\n"
+        "# macOS / Linux — 07:00 every Monday, deep sweep of UK + US + Middle East\n"
+        "0 7 * * 1 cd /path/to/ca_dashboard && /usr/bin/python3 scripts/run_research.py "
+        "--if-due --depth deep --preset 'UK + US + Middle East' >> research.log 2>&1\n\n"
         "# Windows — Task Scheduler, weekly, Monday 07:00\n"
-        "python C:\\path\\to\\ca_dashboard\\scripts\\run_research.py",
+        "python C:\\path\\to\\ca_dashboard\\scripts\\run_research.py --if-due --depth deep",
         language="bash",
     )
 
@@ -835,9 +1296,12 @@ still processing personal data under UK GDPR — *publicly available* does not m
   documented balancing test.
 - **An Article 14 notice.** Because the data comes from third parties rather than the
   individual, you generally have to tell them you hold it.
-- **A way to honour objections.** Suppress a record and the weekly sweep will stop
-  updating it and exclude it from totals.
+- **A way to honour objections.** Suppress a record — on any prospect's page — and the
+  weekly sweep stops updating it and excludes it from every total.
 - **A retention policy** for prospects who never respond.
+
+Different rules apply outside the UK and EU. Searching US, Gulf and Asian markets does
+not exempt the processing from UK GDPR if your firm is established here.
 
 This describes how the software behaves; it is not legal advice.
         """
@@ -850,13 +1314,24 @@ This describes how the software behaves; it is not legal advice.
 
 frame = load_prospects()
 
+PAGES = {
+    "Overview": lambda: page_overview(frame),
+    "Prospect list": lambda: page_list(frame),
+    "Find prospects": lambda: page_find(frame),
+    "Weekly research document": page_research_doc,
+    "How it works": page_methodology,
+}
+
 with st.sidebar:
     st.markdown(f"### ◈ {APP_NAME}")
     st.caption(APP_SUBTITLE)
 
+    # A fresh install has nothing to look at, so it opens on the page that fixes
+    # that rather than on an empty dashboard.
+    order = list(PAGES)
     page = st.radio(
-        "Navigate",
-        ["Overview", "Prospects", "Weekly research document", "Run research", "Methodology"],
+        "Navigate", order,
+        index=order.index("Find prospects") if frame.empty else 0,
         label_visibility="collapsed",
     )
 
@@ -866,29 +1341,22 @@ with st.sidebar:
         due = db.run_due_this_week(conn)
 
     if latest:
-        st.caption(f"Last sweep: {latest['started_at'][:10]} ({latest['status']})")
+        st.caption(
+            f"Last sweep: {latest['started_at'][:10]} — {latest['status']}, "
+            f"{latest['new_prospects']} new"
+        )
     else:
         st.caption("No sweep has run yet.")
     if due:
         st.caption("⚠︎ This week's sweep is due.")
-
+    if not frame.empty:
+        st.caption(f"{len(frame)} people on file")
     st.caption(
         "Companies House: "
         + ("connected ✓" if companies_house_available() else "not configured (optional)")
     )
-    if not frame.empty:
-        st.caption(f"{len(frame)} prospects on file")
 
-if page == "Overview":
-    page_overview(frame)
-elif page == "Prospects":
-    page_prospects(frame)
-elif page == "Weekly research document":
-    page_research_doc()
-elif page == "Run research":
-    page_run_research()
-else:
-    page_methodology()
+PAGES[page]()
 
 st.divider()
 st.caption(
