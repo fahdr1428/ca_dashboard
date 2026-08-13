@@ -23,6 +23,7 @@ from .evidence import classify_source, grade_record
 from .exclusions import screen
 from .extract import ExtractedEvent, extract_event
 from .markets import MARKET_BY_KEY, expand_selection
+from .outreach import extract_advisers
 from .queries import (
     DEFAULT_DEPTH,
     DEPTH_BY_KEY,
@@ -266,6 +267,19 @@ WEALTH_SOURCE: dict[str, str] = {
     "rich_list": "Rich-list inclusion",
 }
 
+def _advisers_text(event: ExtractedEvent) -> str | None:
+    """The professional firms the announcement names, as one readable line.
+
+    This is the warm route and the reason the column exists: a corporate finance
+    partner who has just banked a client's exit is a better introduction than any
+    contact detail.
+    """
+    advisers = extract_advisers(f"{event.title}. {event.summary}")
+    if not advisers:
+        return None
+    return "; ".join(f"{a.firm} ({a.role.lower()})" for a in advisers)
+
+
 #: Suffixes that mark a listed company. Anything else filed at Companies House is
 #: treated as private, which is right far more often than not.
 _LISTED_MARKERS = ("plc", "p.l.c", "public limited", "pjsc", " inc", " corp")
@@ -420,7 +434,9 @@ def _store_person(
             "annual_income_basis": estimate.annual_income_basis,
             "company_status": _company_status(event, ch_match),
             "company_number": ch_match.company_number if ch_match else None,
-            "known_adviser": None,  # only ever set from explicit public reporting
+            # Only ever from explicit public reporting: the firms named in the
+            # announcement itself. Never inferred from who "usually" acts locally.
+            "known_adviser": _advisers_text(event),
             "latest_newsflow": f"{event.published_at:%d %b %Y} · {event.title}"
                                if event.published_at else event.title,
             "evidence_grade": evidence_grade,

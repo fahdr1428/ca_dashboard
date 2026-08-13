@@ -46,13 +46,16 @@ ARTICLES: list[Article] = [
     (
         "Exeter engineering group Halberton Precision Ltd acquired by German rival for £64m",
         "Chairman Gareth Halberton has sold the business he founded in 1999. The Devon "
-        "manufacturer employs 380 people at its Marsh Barton site.",
+        "manufacturer employs 380 people at its Marsh Barton site. Corporate finance "
+        "advice was provided by Ashfords Corporate Finance. Legal advice from Osborne "
+        "Clarke LLP.",
         "BusinessLive South West", 2, "acquisition", "uk-devon",
     ),
     (
         "Marlborough Clinical Holdings Ltd sold to Ardenhall for £210m",
         "Founder Alastair Wren completes sale of the Wiltshire diagnostics group after "
-        "fourteen years. The transaction is the largest healthcare deal in the county this year.",
+        "fourteen years. PKF Francis Clark advised the shareholders, with tax advice "
+        "from Grant Thornton.",
         "Insider Media South West", 4, "business_exit", "uk-wiltshire",
     ),
     (

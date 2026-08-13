@@ -56,6 +56,31 @@ that is created and then hidden still turns up in exports and totals:
 Every refusal is logged with its reason on the **Screened out** page. A screening
 rule you cannot inspect is indistinguishable from a bug.
 
+### Reaching them
+
+Each record carries a **How to reach them** panel, ranked warmest first. The best
+route is not a contact detail at all — it is the corporate finance house, law
+firm or accountant named in the announcement, who has just handled the client's
+exit and already has their trust. Those firms are extracted from the article text
+and fill the *Known adviser* column. Below that come the family investment
+vehicle, the registered office, the Companies House record, the company's own
+published contact details, and other directorships.
+
+Approaches are logged. A prospecting tool that cannot say who has already been
+contacted causes the one failure a client notices — being approached twice by the
+same firm — and the log doubles as the record of processing an accountability
+review will ask for. Logging an outcome of "asked not to be contacted"
+suppresses the record immediately.
+
+**What it will not look up, and why:**
+
+| Refused | Reason |
+| --- | --- |
+| Personal email addresses | Not guessed, not bought, not harvested. Permuted addresses reach other real people at the same firm, and unsolicited mail to an individual subscriber is what PECR restricts. Use the company's published enquiries address, or the adviser. |
+| Home addresses | Companies House suppresses directors' residential addresses deliberately. Reconstructing one for cold outreach is a privacy harm and a regulatory problem. |
+| Personal mobile numbers | Same reasoning, with less patience from the person on the other end. |
+| Automated LinkedIn lookups | Its User Agreement prohibits scraping; the app generates a search link to open by hand. |
+
 ### Evidence grades
 
 Separate from the numeric confidence score, and answering a blunter question:
@@ -301,6 +326,7 @@ wealthscan/
   markets.py                69 markets, presets, and text → market resolution
   exclusions.py             Who is refused, and which sources are never acceptable
   evidence.py               Source-directness grading: High / Medium / Low
+  outreach.py               Contact routes, adviser extraction, and the refusals
   queries.py                14 wealth-event templates, depths, the query matrix
   extract.py                Money, people, companies, event classification
   scoring.py                Estimates (or a stated reason), and confidence
@@ -311,7 +337,7 @@ wealthscan/
 scripts/
   run_research.py           CLI for a scheduler
   seed_demo.py              52 fictional prospects
-tests_py/test_research.py   75 tests
+tests_py/test_research.py   82 tests
 ```
 
 Run the tests with `python -m unittest discover -s tests_py -v`.

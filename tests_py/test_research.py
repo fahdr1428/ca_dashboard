@@ -614,6 +614,97 @@ class TestPeopleFirst(unittest.TestCase):
         self.assertEqual(_titlecase_filed_name("SMITH-JONES, Peter"), "Peter Smith-Jones")
 
 
+class TestOutreach(unittest.TestCase):
+    """Reaching a prospect. The warm route is the adviser who did the deal; the
+    routes this refuses to build matter as much as the ones it does."""
+
+    def test_advisers_are_read_from_the_announcement(self):
+        from wealthscan.outreach import extract_advisers
+        found = extract_advisers(
+            "Corporate finance advice was provided by Ashfords Corporate Finance. "
+            "Legal advice from Osborne Clarke LLP."
+        )
+        firms = {a.firm for a in found}
+        self.assertIn("Ashfords Corporate Finance", firms)
+        self.assertIn("Osborne Clarke LLP", firms)
+        # A full stop ends the sentence, not the firm name.
+        self.assertNotIn("Ashfords Corporate Finance. Legal", firms)
+
+    def test_adviser_roles_are_not_guessed(self):
+        """"X acted for the sellers" states the side, not the discipline. A law
+        firm and a corporate finance house both act for sellers."""
+        from wealthscan.outreach import extract_advisers
+        found = extract_advisers("Michelmores LLP acted for the sellers")
+        self.assertEqual(found[0].firm, "Michelmores LLP")
+        self.assertIn("not stated", found[0].role)
+
+    def test_boilerplate_is_not_a_firm(self):
+        from wealthscan.outreach import extract_advisers
+        for text in ["advised by the board and its management",
+                     "the company advised shareholders of the change",
+                     "no advisers were named"]:
+            self.assertEqual(extract_advisers(text), [], text)
+
+    def test_routes_are_ranked_with_the_introduction_first(self):
+        from wealthscan.outreach import contact_routes
+        routes = contact_routes({
+            "full_name": "Gareth Halberton",
+            "company": "Halberton Precision Ltd",
+            "known_adviser": "Ashfords Corporate Finance",
+            "ch_registered_office": "Unit 14, Marsh Barton, Exeter EX2 8QW",
+            "ch_company_number": "07890123",
+        })
+        self.assertEqual(routes[0].kind, "adviser")
+        self.assertEqual([r.warmth for r in routes], sorted(r.warmth for r in routes))
+        # The registered office must carry its warning, every time.
+        office = next(r for r in routes if r.kind == "registered-office")
+        self.assertIn("not a home address", office.caution)
+
+    def test_no_route_ever_contains_a_personal_contact_detail(self):
+        """The guarantee this module makes. If a future change starts emitting a
+        personal email or a home address, this fails."""
+        from wealthscan.outreach import contact_routes
+        routes = contact_routes({
+            "full_name": "Gareth Halberton", "company": "Halberton Precision Ltd",
+            "known_adviser": "Ashfords", "ch_registered_office": "Unit 14, Exeter",
+            "ch_company_number": "07890123",
+        })
+        blob = " ".join(f"{r.label} {r.detail} {r.url or ''}" for r in routes).lower()
+        self.assertNotIn("@", blob.replace("@company", ""), "no email addresses")
+        for banned in ("home address of", "residential address", "personal mobile"):
+            self.assertNotIn(banned, blob)
+
+    def test_family_office_vehicles_are_recognised(self):
+        from wealthscan.outreach import looks_like_family_office
+        self.assertTrue(looks_like_family_office("Wren Family Investment Company Ltd"))
+        self.assertFalse(looks_like_family_office("Halberton Precision Ltd"))
+
+    def test_contact_log_records_and_objections_suppress(self):
+        import tempfile
+        from wealthscan import db
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "contacts.db"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                pid, _ = db.upsert_prospect(conn, {
+                    "slug": "g", "full_name": "Gareth Halberton",
+                    "market_key": "uk-devon", "market_name": "Devon",
+                    "first_seen": db.now_iso(), "last_updated": db.now_iso(),
+                    "first_seen_week": db.iso_week(),
+                })
+                db.log_contact(conn, pid, {
+                    "channel": "Letter", "route": "Registered office",
+                    "outcome": "No reply yet", "logged_by": "AB",
+                })
+                self.assertEqual(len(db.contacts(conn, pid)), 1)
+                self.assertIn(pid, db.contacted_ids(conn))
+                # The approach is on the prospect's own timeline too.
+                self.assertTrue(
+                    any(e["kind"] == "contacted" for e in db.prospect_events(conn, pid))
+                )
+
+
 class TestScreening(unittest.TestCase):
     """What the book refuses to contain.
 

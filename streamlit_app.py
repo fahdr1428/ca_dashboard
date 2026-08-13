@@ -53,6 +53,7 @@ from wealthscan.queries import (
     PUBLISHER_FEEDS,
     plan_sweep,
 )
+from wealthscan.outreach import REFUSED_ROUTES, contact_routes
 from wealthscan.report import fmt_gbp, generate_and_store
 from wealthscan.research import resolve_lead_with_register, run_research
 from wealthscan.sources import companies_house_available, companies_house_status
@@ -1021,7 +1022,102 @@ def render_prospect_detail(row: pd.Series) -> None:
         st.markdown("**Check it yourself**  \n" + "  \n".join(links))
 
     st.divider()
+    _outreach_panel(row)
+    st.divider()
     _pipeline_controls(row)
+
+
+def _outreach_panel(row: pd.Series) -> None:
+    """How to reach them, warmest route first — and what is deliberately absent."""
+    st.markdown("**How to reach them**")
+
+    record = {
+        key: (row[key] if present(row, key) else None)
+        for key in (
+            "full_name", "company", "known_adviser", "ch_registered_office", "address",
+            "ch_company_number", "ch_company_name", "ch_profile_url",
+        )
+    }
+    routes = contact_routes(record)
+
+    with db.connect() as conn:
+        history = [dict(r) for r in db.contacts(conn, int(row["id"]))]
+
+    if history:
+        st.warning(
+            f"**Already approached {len(history)} time(s)** — most recently "
+            f"{history[0]['created_at'][:10]} by {history[0]['channel'].lower()}"
+            + (f" ({history[0]['outcome']})" if history[0].get("outcome") else "")
+            + ". Check the log below before making contact again."
+        )
+
+    left, right = st.columns([1.6, 1])
+    with left:
+        # Numbered by position, not by the internal warmth rank — a record with no
+        # adviser and no filed address would otherwise start at "5." and look as
+        # though four routes had gone missing.
+        for position, route in enumerate(routes, start=1):
+            with st.container(border=True):
+                st.markdown(
+                    f"**{position}. {route.label}**"
+                    + (f"  ·  [open]({route.url})" if route.url else "")
+                )
+                st.markdown(
+                    f'<div class="reason">{route.detail}</div>', unsafe_allow_html=True
+                )
+                if route.caution:
+                    st.caption(f"⚠︎ {route.caution}")
+
+    with right:
+        st.markdown("**Log an approach**")
+        with st.form(f"contact_{int(row['id'])}"):
+            channel = st.selectbox(
+                "How", ["Introduction requested", "Letter", "Call", "Email to the company",
+                        "Met in person", "Event", "Other"],
+            )
+            route_used = st.selectbox(
+                "Route", ["—"] + [r.label for r in routes],
+            )
+            outcome = st.selectbox(
+                "Outcome", ["No reply yet", "Replied", "Meeting booked", "Declined",
+                            "Asked not to be contacted"],
+            )
+            note = st.text_area("Note", height=80)
+            who = st.text_input("Logged by")
+            if st.form_submit_button("Save to the contact log", type="primary"):
+                with db.connect() as conn:
+                    db.log_contact(conn, int(row["id"]), {
+                        "channel": channel,
+                        "route": None if route_used == "—" else route_used,
+                        "outcome": outcome, "note": note, "logged_by": who,
+                    })
+                    if outcome == "Asked not to be contacted":
+                        db.suppress_prospect(
+                            conn, int(row["id"]),
+                            f"Objected on contact — logged by {who or 'unknown'}.",
+                        )
+                refresh()
+                if outcome == "Asked not to be contacted":
+                    st.warning(
+                        "Recorded as an objection: this record is now suppressed and "
+                        "the weekly sweep will stop updating it."
+                    )
+                else:
+                    st.success("Logged.")
+
+        if history:
+            st.markdown("**Contact log**")
+            for entry in history:
+                st.markdown(
+                    f"- **{entry['created_at'][:10]}** {entry['channel']}"
+                    + (f" via {entry['route']}" if entry.get("route") else "")
+                    + (f" — {entry['outcome']}" if entry.get("outcome") else "")
+                    + (f"  \n  _{entry['note']}_" if entry.get("note") else "")
+                )
+
+    with st.expander("What this app will not look up, and why"):
+        for label, why in REFUSED_ROUTES:
+            st.markdown(f"**{label}** — {why}")
 
 
 def _pipeline_controls(row: pd.Series) -> None:

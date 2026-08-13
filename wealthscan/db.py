@@ -184,6 +184,22 @@ CREATE TABLE IF NOT EXISTS company_leads (
 );
 CREATE INDEX IF NOT EXISTS idx_company_leads_resolved ON company_leads(resolved_at);
 
+-- Outreach the advisor has actually done. Kept because a prospecting tool that
+-- cannot say who has already been contacted causes the one failure a client
+-- notices: being approached twice by the same firm. It doubles as the record of
+-- processing that a UK GDPR accountability review will ask for.
+CREATE TABLE IF NOT EXISTS contacts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    prospect_id INTEGER REFERENCES prospects(id) ON DELETE CASCADE,
+    created_at  TEXT NOT NULL,
+    channel     TEXT NOT NULL,
+    route       TEXT,
+    outcome     TEXT,
+    note        TEXT,
+    logged_by   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_contacts_prospect ON contacts(prospect_id);
+
 -- Refusals, kept rather than discarded. A screening rule you cannot inspect is
 -- indistinguishable from a bug, and "why is nobody from Hampshire showing up"
 -- is only answerable if the rejections are on record.
@@ -513,6 +529,38 @@ def resolve_company_lead(
         "WHERE id = ?",
         (now_iso(), note, people_found, lead_id),
     )
+
+
+def log_contact(conn: sqlite3.Connection, prospect_id: int, entry: dict[str, Any]) -> None:
+    """Record an approach, so nobody is contacted twice by the same firm."""
+    conn.execute(
+        """INSERT INTO contacts
+           (prospect_id, created_at, channel, route, outcome, note, logged_by)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            prospect_id, now_iso(), entry["channel"], entry.get("route"),
+            entry.get("outcome"), entry.get("note"), entry.get("logged_by"),
+        ),
+    )
+    add_event(conn, prospect_id, "contacted",
+              f"{entry['channel']}"
+              + (f" via {entry['route']}" if entry.get("route") else "")
+              + (f" — {entry['outcome']}" if entry.get("outcome") else ""),
+              entry.get("note"))
+
+
+def contacts(conn: sqlite3.Connection, prospect_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM contacts WHERE prospect_id = ? ORDER BY created_at DESC",
+        (prospect_id,),
+    ).fetchall()
+
+
+def contacted_ids(conn: sqlite3.Connection) -> set[int]:
+    return {
+        int(r["prospect_id"])
+        for r in conn.execute("SELECT DISTINCT prospect_id FROM contacts")
+    }
 
 
 def record_exclusion(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:
