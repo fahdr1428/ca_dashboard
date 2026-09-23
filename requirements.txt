@@ -2,7 +2,7 @@
 #
 # Deliberately small. No database server, no API keys required to start, and
 # nothing that needs compiling.
-streamlit>=1.40
-pandas>=2.2
-altair>=5.4
-requests>=2.32
+streamlit>=1.50,<2
+pandas>=2.2,<4
+altair>=5.4,<7
+requests>=2.32,<3

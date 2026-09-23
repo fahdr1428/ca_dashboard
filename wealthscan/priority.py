@@ -242,6 +242,10 @@ def _action(record: dict, state: str, adviser: str, in_progress: bool) -> str:
     """The single thing to do next. One, not a menu."""
     if in_progress:
         return "Already approached this month — follow up rather than start again."
+    land = record.get("wealth_source") == "Land, estate or farming"
+    if state == "Unconfirmed" and land and not record.get("company"):
+        return ("Find the title on HM Land Registry and confirm them as the registered "
+                "proprietor before any approach.")
     if state == "Unconfirmed":
         return "Establish the company and confirm the person on Companies House first."
     if state == "Corroborated" and record.get("company"):
@@ -257,6 +261,9 @@ def _action(record: dict, state: str, adviser: str, in_progress: bool) -> str:
             f"Write to them as a director of {record['company']} at the registered "
             f"office."
         )
+    if land and state == "Corroborated":
+        return ("Confirm the title at HM Land Registry, then approach through the "
+                "estate office or the land agent who handled the sale.")
     return "Find a second independent source before any approach."
 
 

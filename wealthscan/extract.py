@@ -316,6 +316,10 @@ _GENERIC = frozenset({
     "Interiors", "Furniture", "Packaging", "Plastics", "Chemicals", "Textiles",
     "Insurance", "Finance", "Payments", "Robotics", "Analytics", "Networks",
     "Studios", "Agency", "Farms", "Nurseries", "Distillery", "Cider", "Gin",
+    # Investment houses. "Meridian Growth Partners has taken a stake" and "co-led
+    # by Wellcome Growth" have a person's shape; the investor is never the seller.
+    "Growth", "Equity", "Investments", "Investment", "Advisors", "Advisers",
+    "Associates", "Asset", "Assets", "Wealth", "Securities",
     # Landscape and institutions — "Salisbury Plain Farmland sells for £12m" and
     # "Dartmoor National Park buys farm" have a person's shape and no person.
     # Only words that are never surnames: Park, Hill, Wood and Green are, and are
@@ -507,6 +511,9 @@ _SECTOR_NOUNS = (
     "producer", "processor", "wholesaler", "distributor", "haulier", "insurer",
     "lender", "platform", "studio", "practice", "cider maker", "gin maker",
 )
+# Case-insensitive, because headlines are often title case ("Software Firm Kinetic
+# Data Sold"). That lets "Group" inside "Biscayne Health Group Inc" read as a
+# descriptor too; _trim_company refuses the suffix-only capture that follows.
 _SECTOR = "|".join(_ci(n) for n in sorted(_SECTOR_NOUNS, key=len, reverse=True))
 
 #: "Bath-based", "Truro-headquartered" — journalese before a company name.
@@ -591,6 +598,14 @@ _COMPANY_GENERIC = frozenset({
 })
 
 
+#: A capture made only of these is a fragment of a name, never a name.
+_CORPORATE_SUFFIXES = frozenset({
+    "inc", "inc.", "ltd", "ltd.", "limited", "plc", "llc", "llp", "lp", "corp",
+    "corporation", "co", "co.", "group", "holdings", "pjsc", "psc", "ag", "gmbh",
+    "sa", "spa", "bv", "nv", "ab", "as", "oy", "pte", "pty",
+})
+
+
 def _trim_company(candidate: str) -> str | None:
     """Cut a captured phrase down to the name and reject non-names."""
     words = candidate.replace("’", "'").split()
@@ -608,7 +623,11 @@ def _trim_company(candidate: str) -> str | None:
     if not kept or len(kept) > 5:
         return None
     lowered = [k.lower() for k in kept]
-    if all(k in _COMPANY_GENERIC or k in _PLACE_NAMES for k in lowered):
+    if all(k in _CORPORATE_SUFFIXES for k in lowered):
+        return None
+    # "Bristol plc chief executive…" describes a company; it does not name one.
+    if all(k in _COMPANY_GENERIC or k in _PLACE_NAMES or k in _CORPORATE_SUFFIXES
+           for k in lowered):
         return None
     name = " ".join(kept)
     if name.lower() in _PLACE_NAMES or name.lower() in _NOT_PEOPLE:
@@ -688,6 +707,47 @@ def extract_company(text: str, *, exclude: list[str] | tuple[str, ...] = ()) -> 
         if name and len(name.split()) >= 2:
             return name
     return None
+
+
+# ---------------------------------------------------------------------------
+# Land
+# ---------------------------------------------------------------------------
+
+_ACREAGE = re.compile(r"\b(\d[\d,]*(?:\.\d+)?)[- ]acres?\b", re.IGNORECASE)
+_NAMED_LAND = re.compile(
+    r"\b(?:the\s+)?((?:[A-Z][a-z]+\s+){1,3})(?:[Ee]state|[Ll]and|[Ff]arms?|[Vv]alley)\b"
+)
+_NEAR_PLACE = re.compile(r"\bnear\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)")
+_LAND_STOP = frozenset({"The", "A", "An", "Wiltshire", "Dorset", "Devon", "Cornwall",
+                        "Somerset", "Hampshire", "Gloucestershire", "Oxfordshire",
+                        "Sussex", "West", "East", "North", "South", "Landowner",
+                        "Farmland", "Tenanted", "Family"})
+
+
+def extract_landholding(text: str) -> str | None:
+    """A landholding as the source describes it: acreage, a named estate, a place.
+
+    For estate and farming wealth the register that matters is HM Land Registry,
+    not Companies House, and what an advisor needs is enough to find the title:
+    "1,200 acres · Chalke Valley" is searchable; "a Wiltshire estate" is not.
+    Returns None unless the source gives an acreage or a named estate.
+    """
+    text = text or ""
+    parts: list[str] = []
+    acreage = _ACREAGE.search(text)
+    if acreage:
+        parts.append(f"{acreage.group(1)} acres")
+    for match in _NAMED_LAND.finditer(text):
+        words = [w for w in match.group(1).split() if w not in _LAND_STOP]
+        if words:
+            parts.append(" ".join(words))
+            break
+    if not parts:
+        return None
+    near = _NEAR_PLACE.search(text)
+    if near and near.group(1) not in " ".join(parts):
+        parts.append(f"near {near.group(1)}")
+    return " · ".join(parts)
 
 
 # ---------------------------------------------------------------------------

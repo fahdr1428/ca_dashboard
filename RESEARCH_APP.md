@@ -22,17 +22,46 @@ build step, no API key needed to start.
 
 ---
 
-## The seven pages
+## The ten pages
 
-| Page | What it is for |
+Grouped in the sidebar by what you are doing.
+
+| Group | Page | What it is for |
+| --- | --- | --- |
+| Work | **Today** (opens here) | The call list: verified, open, not approached this month, ranked by priority — each with *why now* and the one next step. Below it, the unconfirmed names most worth ten minutes of checking |
+| Work | **Prospect list** | One sortable, filterable table of everyone, sorted by priority. Tick a row, or type a name, to open the record underneath; it stays open while you work on it |
+| Work | **Find the owner** | Real transactions the press left unnamed, and a one-click register lookup to name them |
+| Research | **Find prospects** | Choose where to look and how hard, see the cost, press go |
+| Research | **Add & import** | Add one person by hand, or import a CSV (a Beauhurst export, a spreadsheet of introductions) — through the same screening and grading as the sweep |
+| Research | **Overview** | Totals, addressable assets by market and country, wealth bands, a map |
+| Research | **Weekly document** | The Monday write-up: who is new, why, what each figure rests on |
+| About | **Screened out** | Who the app refused, and why — the rules are inspectable, not hidden |
+| About | **How it works** | Every model assumption, the market list, lawful use, Companies House setup |
+| About | **System check** | What works right now: the book's counts, one-click tests of Google News, the direct feeds and Companies House, feed health, versions |
+
+Every page, and every panel inside a record, sits behind its own error boundary:
+a fault shows as a contained message in that panel and the rest keeps working.
+
+### The record
+
+Answer first: name, company, place, verification state, a **priority score**,
+*why now*, and **Next:** — the single thing to do. Underneath, five tabs:
+
+| Tab | Holds |
 | --- | --- |
-| **Overview** | Totals, addressable assets by market and country, wealth bands, a map |
-| **Prospect list** | One sortable, filterable table of everyone found. Click a row for the full record |
-| **Find prospects** | Choose where to look and how hard, see the cost, press go |
-| **Find the owner** | Real transactions the press left unnamed, and a one-click register lookup to name them |
-| **Screened out** | Who the app refused, and why — the rules are inspectable, not hidden |
-| **Weekly research document** | The Monday write-up: who is new, why, what each figure rests on |
-| **How it works** | Every model assumption, the market list, lawful use, Companies House setup |
+| Summary | Estimated investable assets, income and company revenue (each allowed to say *not disclosed*), how the figure was reached, caveats, place, registered office, sector, known adviser |
+| Evidence | The verification checklist, what the register says, every source with its link, the confidence breakdown, the record's history |
+| Verify | Links to check it yourself (Companies House, the Gazette, news, the Land Registry for land, LinkedIn by hand) and a form to **record what you found** — company number, officer confirmed, PSC band, a second source. Confirming an officer moves the record to *Confirmed* |
+| How to reach | Contact routes, warmest first, the contact log, and what the app refuses to look up |
+| Pipeline | Status, stage, owner, notes, and suppression for objections |
+
+### Priority
+
+Out of 100: **wealth** 30, **verification** 25, **timing** (how recent the money
+is) 20, **reachability** (a named adviser, a family office, a registered office)
+15, and **patch** (inside the target profile) 10. Anyone approached in the last
+30 days is held off the call list, as is anyone Unconfirmed, a client, parked or
+not a fit.
 
 ---
 
@@ -84,6 +113,14 @@ Corroboration is not a substitute for an entity.
 
 Each record shows its checklist — which checks passed, which did not, and the
 single next step that would move it up a tier.
+
+**Land is the exception to "no company, no prospect".** For estate and farming
+wealth the vehicle is land and the register is HM Land Registry. When the source
+describes the holding well enough to find the title — an acreage, a named estate,
+a nearby place ("1,200 acres · Chalke Valley · near Salisbury") — that stands in
+for the company when grading, and the next step becomes a Land Registry title
+search. It does not make the record exportable to a company database, because
+there is still no company to export.
 
 ### Sector
 
@@ -167,10 +204,10 @@ Depth is an explicit choice with an honest cost, shown before you commit:
 
 | Depth | What it does | Target profile (11) | UK+US+ME (46) |
 | --- | --- | --- | --- |
-| **Quick look** | 5 realised-money events, market names only | 55 · <1 min | 230 · ~4 min |
-| **Standard sweep** | All 17 events, main towns folded in | 207 · ~3 min | 802 · ~13 min |
-| **Deep search** | All events, every town, recent + wider window | 836 · ~13 min | 2,672 · ~42 min |
-| **Exhaustive** | Everything, three windows | 1,754 · ~28 min | 5,120 · ~81 min |
+| **Quick look** | Realised-money events, market names only | 67 · <1 min | 282 · ~4 min |
+| **Standard sweep** | All 17 events, main towns folded in | 537 · ~9 min | 2,155 · ~34 min |
+| **Deep search** (default) | All events, 14 towns per market, 90-day window | 874 · ~14 min | 2,830 · ~45 min |
+| **Exhaustive** | Everything, two windows | 1,847 · ~29 min | 5,665 · ~90 min |
 
 The `Find prospects` page shows the real number for whatever you have selected
 before you commit to it, so you never have to guess.
@@ -179,6 +216,16 @@ Towns are OR-ed into each query rather than searched separately — one
 `("Devon" OR "Exeter" OR "Plymouth" OR "Torbay" …)` query finds what four
 separate queries would, for a quarter of the requests. That is what makes a deep
 sweep affordable.
+
+Google ignores every term after the 32nd in a query, silently. Queries are
+packed to stay inside that limit — a long town list is split across several
+queries rather than truncated — so no town and no "founder OR owner" clause is
+ever quietly dropped.
+
+Alongside Google News a sweep reads three confirmed direct feeds (BusinessLive,
+BBC Business, Sky News Business) and site-restricted searches of Insider Media,
+Business Leader, Real Deals and Farmers Weekly. A feed that fails three runs in a
+row is rested for seven days; **System check** shows which.
 
 A **time budget** (default 20 minutes) stops a long run cleanly. Everything found
 before the cut-off is already saved, and running again continues where it left
@@ -317,7 +364,7 @@ and says so in the sidebar. To run it unattended:
 ```bash
 # macOS / Linux — 07:00 every Monday
 0 7 * * 1 cd /path/to/ca_dashboard && python3 scripts/run_research.py \
-  --if-due --depth standard --preset 'UK + US + Middle East' >> research.log 2>&1
+  --if-due --depth deep >> research.log 2>&1
 ```
 
 On Windows, Task Scheduler → weekly, Monday 07:00, action
@@ -362,8 +409,14 @@ Two caveats worth knowing:
 ## Layout
 
 ```
-streamlit_app.py            Overview, Prospect list, Find prospects,
-                            Weekly research document, How it works
+streamlit_app.py            Navigation, and the list, find, owner, overview,
+                            weekly, screened-out and how-it-works pages
+ui/
+  common.py                 Look, cached data, error boundary, small helpers
+  record.py                 One person's record: header and five tabs
+  today.py                  The call list
+  workbench_page.py         Add one person; import a CSV
+  system.py                 System check
 wealthscan/
   config.py                 Thresholds and every model assumption, in one place
   markets.py                69 markets, presets, and text → market resolution
@@ -372,7 +425,9 @@ wealthscan/
   outreach.py               Contact routes, adviser extraction, and the refusals
   legitimacy.py             Who is really a prospect, and how well verified
   sectors.py                Filed SIC codes first, keyword inference second
-  queries.py                14 wealth-event templates, depths, the query matrix
+  priority.py               Priority score, why now, next step, the call list rule
+  workbench.py              Manual verification, manual add, CSV import
+  queries.py                17 wealth-event templates, depths, the query matrix
   extract.py                Money, people, companies, event classification
   scoring.py                Estimates (or a stated reason), and confidence
   sources.py                Polite HTTP, RSS/Atom parsing, Companies House
@@ -382,10 +437,13 @@ wealthscan/
 scripts/
   run_research.py           CLI for a scheduler
   seed_demo.py              52 fictional prospects
-tests_py/test_research.py   91 tests
+tests_py/test_research.py   137 tests
 ```
 
 Run the tests with `python -m unittest discover -s tests_py -v`.
+
+After changing code, restart `streamlit run` — file watching is switched off in
+`.streamlit/config.toml`, so a running server keeps serving the old code.
 
 The database migrates itself on startup, including from the earlier
 county-based schema — prospects, notes and citations are carried across rather

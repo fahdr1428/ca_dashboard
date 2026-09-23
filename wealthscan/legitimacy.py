@@ -170,8 +170,16 @@ def assess(
     ownership_filed: bool,
     text: str = "",
     trusted_publisher: bool = False,
+    landholding: str | None = None,
 ) -> Legitimacy:
-    """Grade one person against what is actually known about them."""
+    """Grade one person against what is actually known about them.
+
+    ``landholding`` is for estate and farming wealth, where the vehicle is land
+    rather than a company: a described holding (acreage, a named estate) can be
+    looked up at HM Land Registry, and stands in for the company when deciding
+    whether the record is corroborated. It never makes a record exportable to a
+    company database — there is no company to export.
+    """
     checks: list[Check] = []
 
     checks.append(Check(
@@ -181,6 +189,13 @@ def assess(
         else "No company was extracted, so there is nothing to look this person up "
              "against — not in Companies House, not in Beauhurst, not anywhere.",
     ))
+    if landholding:
+        checks.append(Check(
+            "land", "Landholding described",
+            True,
+            f"The source describes the holding ({landholding}), which is enough to "
+            f"find the title at HM Land Registry.",
+        ))
     checks.append(Check(
         "role", "Role stated",
         bool(job_title),
@@ -232,7 +247,7 @@ def assess(
 
     if register_matched:
         state = CONFIRMED
-    elif "company" in passed and "role" in passed and (
+    elif ("company" in passed or "land" in passed) and "role" in passed and (
         "corroboration" in passed or "publisher" in passed
     ):
         state = CORROBORATED
@@ -243,6 +258,12 @@ def assess(
         next_step = (
             "Confirmed as a real person at a real company. Pull the PSC register "
             "entry to replace the assumed stake with a filed band."
+        )
+    elif "company" not in passed and "land" in passed:
+        next_step = (
+            f"Search HM Land Registry for the title ({landholding}) and confirm "
+            f"{name} is the registered proprietor. If the land is held in a company "
+            f"or partnership, record it — that makes the owner findable everywhere."
         )
     elif "company" not in passed:
         next_step = (

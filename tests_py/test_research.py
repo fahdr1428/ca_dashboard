@@ -24,7 +24,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from wealthscan.extract import (  # noqa: E402
-    classify, extract_company, extract_event, extract_people, parse_money,
+    classify, extract_company, extract_event, extract_people, parse_money, reconcile,
 )
 from wealthscan.markets import (  # noqa: E402
     ALL_MARKETS, CORE_MARKET_KEYS, GROUP_ORDER, MARKET_BY_KEY, PRESETS,
@@ -749,6 +749,66 @@ class TestHeadlineExtraction(unittest.TestCase):
         "Marks and Spencer reports record profits",
         "Sarah's birthday party was fun",
     ]
+
+    def test_investment_houses_are_never_recorded_as_people(self):
+        people, company = reconcile(
+            "Quantock Renewables Group Ltd backed by private equity. Meridian Growth "
+            "Partners has taken a minority stake in the Taunton company. Founder Priya "
+            "Nadkarni retains control."
+        )
+        self.assertEqual([p.name for p in people], ["Priya Nadkarni"])
+        self.assertEqual(company, "Quantock Renewables Group Ltd")
+        people, _ = reconcile(
+            "Oxford biotech Wytham Bio Ltd secures £54m. Chief Scientific Officer Eleanor "
+            "Wytham co-founded it. The funding round was co-led by Wellcome Growth."
+        )
+        self.assertEqual([p.name for p in people], ["Eleanor Wytham"])
+
+    def test_a_place_and_a_suffix_describe_a_company_rather_than_name_one(self):
+        _, company = reconcile(
+            "Bristol plc chief executive's pay package reaches £2.4m. Chief executive "
+            "Fenella Rooksby received a £640,000 salary. Avon Gorge Utilities PLC also "
+            "disclosed her director shareholding."
+        )
+        self.assertEqual(company, "Avon Gorge Utilities PLC")
+
+    def test_a_landholding_is_described_well_enough_to_find_the_title(self):
+        from wealthscan.extract import extract_landholding
+        self.assertEqual(
+            extract_landholding(
+                "Wiltshire estate sells 1,200 acres of farmland for £14.8m. The Chalke "
+                "Valley land has been sold by owner Hugh Fanshawe-Barrow, whose family "
+                "have farmed near Salisbury since the 1920s."),
+            "1,200 acres · Chalke Valley · near Salisbury",
+        )
+        self.assertEqual(
+            extract_landholding("Landowner Verity Crabbe has restructured the "
+                                "3,400-acre estate near Blandford."),
+            "3,400 acres · near Blandford",
+        )
+        # "A Wiltshire estate" cannot be found at the Land Registry.
+        self.assertIsNone(extract_landholding("A Wiltshire estate was sold."))
+
+    def test_a_described_landholding_stands_in_for_a_company_but_is_not_exportable(self):
+        from wealthscan.legitimacy import assess
+        common = dict(name="Hugh Fanshawe-Barrow", job_title="Owner", company=None,
+                      publisher="Insider Media South West", source_count=1,
+                      register_matched=False, ownership_filed=False,
+                      trusted_publisher=True)
+        self.assertEqual(assess(**common).state, "Unconfirmed")
+        with_land = assess(**common, landholding="1,200 acres · Chalke Valley")
+        self.assertEqual(with_land.state, "Corroborated")
+        self.assertIn("Land Registry", with_land.next_step)
+        self.assertFalse(with_land.is_researchable)
+
+    def test_a_corporate_suffix_alone_is_never_a_company(self):
+        # "Group" in "Biscayne Health Group Inc" reads like a sector descriptor
+        # ("healthcare group X"), which once left the company recorded as "Inc".
+        self.assertEqual(
+            extract_company("Miami healthcare founder nets $220m as Biscayne Health "
+                            "Group Inc is acquired."),
+            "Biscayne Health Group Inc",
+        )
 
     def test_companies_come_from_the_target_position(self):
         from wealthscan.extract import reconcile
@@ -1630,6 +1690,57 @@ class TestStorage(unittest.TestCase):
                 row = db.prospect(conn, prospect_id)
                 self.assertIsNone(row["investable_mid_gbp"])
 
+
+class TestInterfaceLogic(unittest.TestCase):
+    """The decisions the pages make, tested without a browser."""
+
+    def _frame(self):
+        import pandas as pd
+        return pd.DataFrame([
+            {"id": 1, "full_name": "A", "verification_state": "Confirmed", "status": "New",
+             "in_progress": False, "priority": 70, "investable_mid_gbp": 9e6},
+            {"id": 2, "full_name": "B", "verification_state": "Corroborated", "status": "New",
+             "in_progress": False, "priority": 90, "investable_mid_gbp": 20e6},
+            {"id": 3, "full_name": "C", "verification_state": "Unconfirmed", "status": "New",
+             "in_progress": False, "priority": 99, "investable_mid_gbp": 40e6},
+            {"id": 4, "full_name": "D", "verification_state": "Confirmed", "status": "Client",
+             "in_progress": False, "priority": 95, "investable_mid_gbp": 30e6},
+            {"id": 5, "full_name": "E", "verification_state": "Confirmed", "status": "New",
+             "in_progress": True, "priority": 96, "investable_mid_gbp": 30e6},
+        ])
+
+    def test_call_list_is_verified_open_and_uncontacted_best_first(self):
+        from ui.today import shortlist_frame
+        self.assertEqual(list(shortlist_frame(self._frame())["id"]), [2, 1])
+
+    def test_unconfirmed_names_go_to_the_check_list_not_the_call_list(self):
+        from ui.today import to_check_frame
+        self.assertEqual(list(to_check_frame(self._frame())["id"]), [3])
+
+    def test_upload_drops_leading_notes_but_keeps_hashes_in_values(self):
+        from ui.workbench_page import read_upload
+        raw = ("\ufeff# note one\n# note two\nName,Address\n"
+               "Jane Example,Unit #3 Marsh Barton\n").encode("utf-8")
+        frame = read_upload(raw)
+        self.assertEqual(list(frame.columns), ["Name", "Address"])
+        self.assertEqual(frame.iloc[0]["Address"], "Unit #3 Marsh Barton")
+
+    def test_upload_reads_windows_encoded_excel_files(self):
+        from ui.workbench_page import read_upload
+        frame = read_upload("Name,Deal value\nJane Example,£12m\n".encode("cp1252"))
+        self.assertEqual(frame.iloc[0]["Deal value"], "£12m")
+
+    def test_network_errors_are_explained_in_plain_words(self):
+        from ui.system import plain_network_error
+        self.assertIn("proxy", plain_network_error(
+            "Google News: ProxyError — Tunnel connection failed: 403 Forbidden"))
+        self.assertIn("404", plain_network_error("BBC: HTTP 404"))
+
+    def test_only_real_web_addresses_become_links(self):
+        from ui.common import is_web_link
+        self.assertTrue(is_web_link("https://www.example.com/a"))
+        self.assertFalse(is_web_link("import://Beauhurst export/jane-example"))
+        self.assertFalse(is_web_link(None))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

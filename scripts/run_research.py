@@ -3,7 +3,7 @@
 
     python scripts/run_research.py                          # deep, UK + US + Middle East
     python scripts/run_research.py --depth standard         # faster
-    python scripts/run_research.py --preset Everywhere      # all 70 markets
+    python scripts/run_research.py --preset Everywhere      # all 69 markets
     python scripts/run_research.py --markets uk-devon uk-london
     python scripts/run_research.py --verify                 # add Companies House checks
     python scripts/run_research.py --if-due                 # skip if already run this week

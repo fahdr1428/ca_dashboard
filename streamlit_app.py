@@ -5,7 +5,7 @@ Run it with:
     streamlit run streamlit_app.py
 
 No database server, no build step, no API key required to start. The research
-sweep reads public news across 70 markets; Companies House verification is an
+sweep reads public news across 69 markets; Companies House verification is an
 optional bonus that turns an assumed shareholding into a filed one.
 
 The interface is written for an advisor, not an engineer: every control says what
@@ -46,7 +46,6 @@ from wealthscan.markets import (
     GROUP_ORDER,
     MARKET_BY_KEY,
     PRESETS,
-    expand_selection,
     markets_in_group,
 )
 from wealthscan.queries import (
@@ -58,11 +57,31 @@ from wealthscan.queries import (
     PUBLISHER_FEEDS,
     plan_sweep,
 )
-from wealthscan.outreach import REFUSED_ROUTES, contact_routes
 from wealthscan.sectors import SECTORS
-from wealthscan.report import fmt_gbp, generate_and_store
+from wealthscan.report import generate_and_store
 from wealthscan.research import resolve_lead_with_register, run_research
 from wealthscan.sources import companies_house_available, companies_house_status
+
+from ui.common import (
+    ACCENT,
+    BAND_ORDER,
+    estimate_disclaimer,
+    fmt_gbp,
+    guarded,
+    inject_css,
+    is_web_link,
+    load_prospects,
+    load_runs,
+    load_reports,
+    load_sources_index,
+    masthead,
+    refresh,
+    where_text,
+)
+from ui.record import render_record
+from ui.system import page_system
+from ui.today import page_today
+from ui.workbench_page import page_workbench
 
 st.set_page_config(
     page_title=f"{APP_NAME} — Private Wealth",
@@ -71,187 +90,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Brass on ink rather than the usual dashboard teal-on-slate. A tool an advisor
-# opens every morning should look like the rest of their working life —
-# closer to a private-client report than to an analytics console.
-ACCENT = "#b8945f"
-ACCENT_SOFT = "rgba(184,148,95,.18)"
-BAND_ORDER = [
-    "Not estimated", "Below £7.5m", "£7.5m – £15m", "£15m – £30m",
-    "£30m – £50m", "£50m – £100m", "£100m+",
-]
-
-CSS = """
-<style>
-  :root {
-    --brass: #b8945f;
-    --brass-soft: rgba(184,148,95,.16);
-    --rule: rgba(184,148,95,.28);
-  }
-  .block-container { padding-top: 1.2rem; max-width: 1680px; }
-
-  /* Editorial headings, tabular data. The mix is the identity: a serif
-     masthead over numbers that line up in columns. */
-  h1, h2, h3, .masthead-name {
-    font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
-    letter-spacing: -.01em;
-  }
-  h1 { font-weight: 600; }
-  h1::after {
-    content: ""; display: block; width: 3.2rem; height: 2px;
-    background: var(--brass); margin-top: .55rem; opacity: .85;
-  }
-
-  [data-testid="stMetricValue"] {
-    font-size: 1.55rem; font-variant-numeric: tabular-nums; letter-spacing: -.01em;
-  }
-  [data-testid="stMetricLabel"] {
-    font-size: .68rem; text-transform: uppercase; letter-spacing: .08em; opacity: .68;
-  }
-
-  .masthead { display:flex; align-items:baseline; gap:.5rem; margin-bottom:.1rem; }
-  .masthead-mark { color: var(--brass); font-size: 1.05rem; }
-  .masthead-name { font-size: 1.12rem; font-weight: 600; }
-  .masthead-rule { height:1px; background:var(--rule); margin:.6rem 0 .5rem; }
-
-  .reason { font-size: .82rem; opacity: .82; line-height: 1.6; margin: .15rem 0 .5rem; }
-  .pill { display:inline-block; padding:.14rem .55rem; border-radius:2px; font-size:.68rem;
-          font-weight:600; letter-spacing:.02em; text-transform:uppercase;
-          border:1px solid rgba(140,140,140,.32); margin-right:.35rem; }
-  .pill-good { background:var(--brass-soft); border-color:var(--rule); color:var(--brass); }
-  .pill-warn { background:rgba(180,83,9,.16);  border-color:rgba(180,83,9,.5); }
-  .pill-none { background:transparent; opacity:.72; }
-  .step { font-size:.68rem; text-transform:uppercase; letter-spacing:.1em;
-          color:var(--brass); font-weight:700; margin-bottom:.25rem; }
-
-  table, [data-testid="stDataFrame"] { font-variant-numeric: tabular-nums; }
-  [data-testid="stSidebar"] { border-right: 1px solid var(--rule); }
-</style>
-"""
-st.markdown(CSS, unsafe_allow_html=True)
-
+inject_css()
 db.init_db()
-
-
-# ---------------------------------------------------------------------------
-# Data access
-# ---------------------------------------------------------------------------
-
-
-@st.cache_data(ttl=15)
-def load_prospects() -> pd.DataFrame:
-    with db.connect() as conn:
-        rows = [dict(r) for r in db.all_prospects(conn)]
-    if not rows:
-        return pd.DataFrame()
-    frame = pd.DataFrame(rows)
-    frame["lat"] = frame["market_key"].map(
-        lambda k: MARKET_BY_KEY[k].lat if k in MARKET_BY_KEY else None
-    )
-    frame["lon"] = frame["market_key"].map(
-        lambda k: MARKET_BY_KEY[k].lon if k in MARKET_BY_KEY else None
-    )
-    return frame
-
-
-@st.cache_data(ttl=15)
-def load_runs() -> list[dict]:
-    with db.connect() as conn:
-        return [dict(r) for r in db.runs(conn, limit=25)]
-
-
-@st.cache_data(ttl=15)
-def load_reports() -> list[dict]:
-    with db.connect() as conn:
-        return [dict(r) for r in db.reports(conn)]
-
-
-@st.cache_data(ttl=15)
-def load_sources_index() -> dict[int, list[dict]]:
-    """Every citation, grouped by prospect.
-
-    Loaded in one query rather than one per row: the table shows a source link on
-    each line, and 300 prospects would otherwise mean 300 round trips per redraw.
-    """
-    with db.connect() as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM sources ORDER BY published_at DESC"
-        )]
-    index: dict[int, list[dict]] = {}
-    for row in rows:
-        index.setdefault(int(row["prospect_id"]), []).append(row)
-    return index
-
-
-def events_for(prospect_id: int) -> list[dict]:
-    with db.connect() as conn:
-        return [dict(r) for r in db.prospect_events(conn, prospect_id)]
-
-
-def refresh() -> None:
-    load_prospects.clear()
-    load_runs.clear()
-    load_reports.clear()
-    load_sources_index.clear()
-
-
-# ---------------------------------------------------------------------------
-# Shared fragments
-# ---------------------------------------------------------------------------
-
-
-def estimate_disclaimer() -> None:
-    st.caption(
-        "Every monetary figure here is a **modelled estimate derived from public "
-        "reporting**, not a verified statement of wealth. Press coverage almost never "
-        "states an individual's shareholding, so it is assumed — the largest single "
-        "source of error. Verify on Companies House before relying on a figure."
-    )
-
-
-def present(row, key: str) -> bool:
-    """True when a field actually holds a value.
-
-    pandas turns SQL NULLs into NaN, and `bool(float("nan"))` is True — so a
-    plain truthiness check would claim a shareholding was "filed on the PSC
-    register" for every prospect that has no such record. Falsely asserting
-    verification is the worst failure this app could have, so every optional
-    field is tested through here.
-    """
-    try:
-        if key not in row:
-            return False
-    except TypeError:
-        return False
-    value = row[key]
-    if value is None:
-        return False
-    try:
-        if pd.isna(value):
-            return False
-    except (TypeError, ValueError):
-        pass
-    return str(value).strip() not in ("", "nan", "None")
-
-
-def confidence_pill(score: int, band: str) -> str:
-    css = "pill-good" if score >= 68 else "pill-warn" if score >= 45 else "pill-none"
-    return f'<span class="pill {css}">{band} · {score}</span>'
-
-
-def where_text(row) -> str:
-    """One readable location line, honest about how it was established."""
-    parts = [
-        str(row[k]) for k in ("locality", "market_name", "country") if present(row, k)
-    ]
-    # "Exeter, Devon, United Kingdom" — but never "Devon, Devon" or
-    # "Connecticut, Connecticut & Tri-State", so substrings count as duplicates.
-    kept: list[str] = []
-    for part in parts:
-        if any(part in seen or seen in part for seen in kept):
-            continue
-        kept.append(part)
-    return ", ".join(kept) or "—"
 
 
 # ---------------------------------------------------------------------------
@@ -537,6 +377,7 @@ def _run_history() -> None:
 
 
 SORTS = {
+    "Priority (who to call first)": ("priority", False),
     "Estimated net worth (highest first)": ("investable_mid_gbp", False),
     "Estimated annual income (highest first)": ("annual_income_gbp", False),
     "Company revenue (highest first)": ("company_revenue_gbp", False),
@@ -784,7 +625,7 @@ def _company_export(view: pd.DataFrame) -> str:
 def page_list(frame: pd.DataFrame) -> None:
     st.title("Prospect list")
     if frame.empty:
-        st.info("Nothing here yet. Run a search from **Find prospects** in the sidebar.")
+        st.info("Nothing here yet. Run a search from **Find prospects**, or bring a list in through **Add & import**.")
         return
 
     view = _filters(frame)
@@ -795,13 +636,18 @@ def page_list(frame: pd.DataFrame) -> None:
 
     sources = load_sources_index()
 
-    def first_source(prospect_id: int, field: str) -> str:
-        rows = sources.get(int(prospect_id), [])
-        return str(rows[0].get(field) or "") if rows else ""
+    def first_link(prospect_id: int) -> str | None:
+        # An imported row carries an ``import://`` reference: meaningful to the
+        # book, a dead link in a browser. Only real web addresses become links.
+        for source in sources.get(int(prospect_id), []):
+            if is_web_link(source.get("url")):
+                return str(source["url"])
+        return None
 
     # Every monetary column is named "Est." because a bare number in a table
     # reads as a fact no matter what the footnote says.
     table = pd.DataFrame({
+        "Priority": pd.to_numeric(view["priority"], errors="coerce"),
         "Name": view["full_name"],
         "Role": view["job_title"].fillna(""),
         "Company / vehicle": view["company"].fillna(""),
@@ -817,10 +663,11 @@ def page_list(frame: pd.DataFrame) -> None:
         "Sector": view["sector"].fillna("—"),
         "Evidence": view["evidence_grade"].fillna("Low"),
         "Confidence": view["confidence"],
+        "Why now": view["why_now"].fillna(""),
         "Wealth source": view["wealth_source"].fillna("—"),
         "Latest newsflow": view["latest_newsflow"].fillna(""),
         "Pipeline": view["status"],
-        "Source": view["id"].map(lambda i: first_source(i, "url")),
+        "Source": view["id"].map(first_link),
     }).reset_index(drop=True)
 
     selection = st.dataframe(
@@ -831,6 +678,11 @@ def page_list(frame: pd.DataFrame) -> None:
         on_select="rerun",
         selection_mode="single-row",
         column_config={
+            "Priority": st.column_config.ProgressColumn(
+                "Priority", min_value=0, max_value=100, format="%d", width="small",
+                help="Who to call first: wealth, verification, how recent the money is, "
+                     "how warm the route in is, and whether they are in your patch.",
+            ),
             "Name": st.column_config.TextColumn(pinned=True, width="medium"),
             "Role": st.column_config.TextColumn(width="small"),
             "Company / vehicle": st.column_config.TextColumn(width="medium"),
@@ -875,31 +727,38 @@ def page_list(frame: pd.DataFrame) -> None:
                 help="How well evidenced the record is overall, across six dimensions — "
                      "a separate question from how wealthy the person is.",
             ),
+            "Why now": st.column_config.TextColumn(width="large"),
             "Wealth source": st.column_config.TextColumn(width="medium"),
             "Latest newsflow": st.column_config.TextColumn(width="large"),
             "Pipeline": st.column_config.TextColumn(width="small"),
             "Source": st.column_config.LinkColumn(
                 "Source", display_text="open", width="small",
-                help="The first citation on the record. The full list is on the record "
-                     "itself.",
+                help="The first web citation on the record. The full list is on the "
+                     "record itself.",
             ),
         },
     )
-    st.caption(
-        "Click the box at the start of a row to open that person's full record below — "
-        "every figure, how it was reached, every source, and what to do next. Click any "
-        "column heading to sort by it. Columns continue to the right."
-    )
     # Streamlit prints a greyed "None" for an empty numeric cell. In a table of
-    # wealth figures that is one glance away from being read as data, so it gets
-    # spelled out rather than left to the reader.
+    # wealth figures that is one glance away from being read as data, so it is
+    # spelled out — once, alongside how to use the table.
     st.caption(
-        "**“None” in a money column means not publicly disclosed — it never means zero, "
-        "and it never means the person has nothing.** Every figure shown is a modelled "
+        "Tick the box at the start of a row to open that person's record below. Click a "
+        "heading to sort; columns continue to the right. **A blank or “None” in a money "
+        "column means not publicly disclosed — never zero.** Every figure is a modelled "
         "estimate unless the record says it was disclosed."
     )
 
-    estimate_disclaimer()
+    # Which record is open is remembered by person, not by row position: saving a
+    # note refreshes the table, and a row number would then point at someone else.
+    ids = [int(i) for i in view["id"]]
+    picked = tuple(
+        ids[r] for r in (getattr(selection, "selection", {}).get("rows", []) or [])
+        if r < len(ids)
+    )
+    if picked != st.session_state.get("_list_selection"):
+        st.session_state["_list_selection"] = picked
+        if picked:
+            st.session_state["open_prospect"] = picked[0]
 
     downloads = st.columns([1, 1, 2])
     downloads[0].download_button(
@@ -931,376 +790,39 @@ def page_list(frame: pd.DataFrame) -> None:
         f"without an entity behind them."
     )
 
-    rows = list(getattr(selection, "selection", {}).get("rows", []) or [])
+    open_id = st.session_state.get("open_prospect")
+    match = frame[frame["id"] == open_id] if open_id is not None else frame.iloc[0:0]
     st.divider()
-    if not rows:
+    if match.empty:
+        st.caption("No record open. Tick a row above, or open someone by name:")
+        _open_by_name(view)
         return
 
-    row = view.iloc[rows[0]]
-    render_prospect_detail(row)
+    bar = st.columns([4, 1])
+    with bar[0]:
+        _open_by_name(view)
+    if bar[1].button("Close record", width="stretch"):
+        st.session_state.pop("open_prospect", None)
+        st.rerun()
+    with guarded("This record"):
+        render_record(match.iloc[0])
 
 
-# ---------------------------------------------------------------------------
-# The record
-# ---------------------------------------------------------------------------
+def _open_by_name(view: pd.DataFrame) -> None:
+    names = {int(r["id"]): f"{r['full_name']}" + (f" — {r['company']}" if isinstance(r["company"], str) and r["company"] else "")
+             for _, r in view.iterrows()}
 
+    def choose() -> None:
+        chosen = st.session_state.get("_open_by_name")
+        if chosen is not None:
+            st.session_state["open_prospect"] = chosen
+        st.session_state["_open_by_name"] = None
 
-def render_prospect_detail(row: pd.Series) -> None:
-    """Everything behind one prospect: the figure, its basis, and its evidence."""
-    heading = str(row["full_name"])
-    if present(row, "job_title"):
-        heading += f", {row['job_title']}"
-    if present(row, "company"):
-        heading += f" · {row['company']}"
-    st.subheader(heading)
-    grade = str(row["evidence_grade"]) if present(row, "evidence_grade") else "Low"
-    grade_css = {"High": "pill-good", "Medium": "pill-warn"}.get(grade, "pill-none")
-    st.markdown(
-        f'<span class="pill {grade_css}">Evidence: {grade}</span>'
-        + confidence_pill(int(row["confidence"]), str(row["confidence_band"]))
-        + f'<span class="pill pill-none">{row["cohort"]}</span>'
-        + f'<span class="pill pill-none">{row["wealth_band"]}</span>'
-        + (f'<span class="pill pill-none">{row["company_status"]} company</span>'
-           if present(row, "company_status") else "")
-        + (f'<span class="pill pill-good">Companies House ✓</span>'
-           if present(row, "ch_officer_name") else ""),
-        unsafe_allow_html=True,
+    st.selectbox(
+        "Open a record", list(names), index=None, format_func=names.get,
+        placeholder="Type a name to open their record…", label_visibility="collapsed",
+        key="_open_by_name", on_change=choose,
     )
-    if present(row, "evidence_basis"):
-        st.caption(row["evidence_basis"])
-
-    with st.expander(
-        f"Verification — {row['verification_state'] if present(row, 'verification_state') else 'Unconfirmed'}"
-        f" ({int(row['legitimacy_score']) if present(row, 'legitimacy_score') else 0}% of checks passed)",
-        expanded=(not present(row, "verification_state")
-                  or str(row["verification_state"]) == "Unconfirmed"),
-    ):
-        for check in (json.loads(row["legitimacy_checks"])
-                      if present(row, "legitimacy_checks") else []):
-            st.markdown(
-                f"{'✅' if check['passed'] else '⬜'} **{check['label']}** — {check['why']}"
-            )
-        if present(row, "legitimacy_next_step"):
-            st.info(f"**To verify further** — {row['legitimacy_next_step']}")
-
-    left, right = st.columns([1.5, 1])
-
-    with left:
-        if present(row, "investable_mid_gbp"):
-            st.metric(
-                "Est. net worth (investable)",
-                fmt_gbp(row["investable_mid_gbp"]),
-                help="ESTIMATE, modelled from reported figures. Not a verified amount.",
-            )
-            st.caption(
-                f"Range {fmt_gbp(row['investable_low_gbp'])} – "
-                f"{fmt_gbp(row['investable_high_gbp'])} · gross estimated wealth "
-                f"{fmt_gbp(row['gross_mid_gbp'])}"
-            )
-            st.markdown(
-                f'<div class="reason"><strong>How that figure was reached:</strong> '
-                f'{row["estimate_method"]}</div>',
-                unsafe_allow_html=True,
-            )
-        else:
-            st.markdown("**Estimated investable assets:** _not estimated_")
-            st.markdown(
-                '<div class="reason"><strong>Why not:</strong> '
-                + (str(row["not_estimated_reason"]) if present(row, "not_estimated_reason")
-                   else "No basis for an estimate was found.")
-                + "</div>",
-                unsafe_allow_html=True,
-            )
-
-        # The brief's other three money columns, each allowed to say "not
-        # publicly disclosed" rather than showing a modelled stand-in.
-        facts = st.columns(3)
-        facts[0].metric(
-            "Est. annual comp / dividend",
-            fmt_gbp(row["annual_income_gbp"]) if present(row, "annual_income_gbp")
-            else "not disclosed",
-        )
-        facts[1].metric(
-            "Company revenue",
-            fmt_gbp(row["company_revenue_gbp"]) if present(row, "company_revenue_gbp")
-            else "not disclosed",
-        )
-        facts[2].metric(
-            "Sector",
-            str(row["sector"]) if present(row, "sector") else "—",
-            help=str(row["sector_detail"]) if present(row, "sector_detail") else None,
-        )
-        if present(row, "sector_basis") and str(row["sector_basis"]) == "inferred":
-            st.caption(
-                "Sector is inferred from the wording of the source, not from a filed "
-                "SIC code. Connect Companies House to replace the guess with the "
-                "company's own classification."
-            )
-        if present(row, "annual_income_basis"):
-            st.markdown(
-                f'<div class="reason"><strong>Income basis:</strong> '
-                f'{row["annual_income_basis"]}</div>',
-                unsafe_allow_html=True,
-            )
-        if present(row, "known_adviser"):
-            st.markdown(
-                f'<div class="reason"><strong>Known adviser:</strong> '
-                f'{row["known_adviser"]} — as publicly reported.</div>',
-                unsafe_allow_html=True,
-            )
-        if present(row, "latest_newsflow"):
-            st.markdown(
-                f'<div class="reason"><strong>Latest newsflow:</strong> '
-                f'{row["latest_newsflow"]}</div>',
-                unsafe_allow_html=True,
-            )
-
-        caveats = json.loads(row["estimate_caveats"]) if present(row, "estimate_caveats") else []
-        if caveats:
-            st.markdown("**Caveats**")
-            for caveat in caveats:
-                st.markdown(f'<div class="reason">• {caveat}</div>', unsafe_allow_html=True)
-
-        if present(row, "rationale"):
-            st.markdown("**Why they were identified**")
-            st.markdown(f'<div class="reason">{row["rationale"]}</div>', unsafe_allow_html=True)
-
-        st.markdown("**Sources**")
-        for source in load_sources_index().get(int(row["id"]), []):
-            published = (source.get("published_at") or "")[:10]
-            st.markdown(
-                f"- [{source['title']}]({source['url']}) — "
-                f"{source.get('publisher') or 'source'}"
-                + (f" · {published}" if published else "")
-                + (f" · {source['event_label']}" if source.get("event_label") else "")
-            )
-            if source.get("rationale"):
-                st.caption(source["rationale"])
-
-        history = events_for(int(row["id"]))
-        if history:
-            with st.expander(f"Record history ({len(history)} entries)"):
-                for entry in history:
-                    st.markdown(
-                        f"**{entry['created_at'][:10]}** · {entry['kind']} — {entry['message']}"
-                    )
-
-    with right:
-        st.markdown("**Where they are**")
-        st.markdown(f'<div class="reason">{where_text(row)}</div>', unsafe_allow_html=True)
-        if row.get("market_source") != "text":
-            st.caption(
-                "The article does not name a place. This market comes from the search "
-                "that found the story — confirm it before acting on the record."
-            )
-        elif present(row, "matched_place"):
-            st.caption(f"Located from “{row['matched_place']}” in the source text.")
-
-        address = (
-            row["ch_registered_office"] if present(row, "ch_registered_office")
-            else row["address"] if present(row, "address") else None
-        )
-        if address:
-            st.markdown("**Registered office**")
-            st.markdown(f'<div class="reason">{address}</div>', unsafe_allow_html=True)
-            st.caption(
-                "The company's filed address from Companies House. Not a home address, "
-                "and it must not be treated as one."
-            )
-
-        st.markdown("**Confidence**")
-        detail = json.loads(row["confidence_detail"]) if present(row, "confidence_detail") else []
-        for dimension in detail:
-            st.progress(
-                min(100, max(0, int(dimension["score"]))) / 100,
-                text=f"{dimension['label']} — {dimension['score']}/100",
-            )
-            st.caption(dimension["why"])
-
-        if present(row, "next_action"):
-            st.info(f"**Best next action** — {row['next_action']}")
-
-        st.markdown("**Verification**")
-        if present(row, "ch_ownership_band"):
-            st.success(
-                f"Shareholding filed at {row['ch_ownership_band']} on the Companies "
-                f"House PSC register — this stake is a fact, not an assumption."
-            )
-        elif present(row, "ch_officer_name"):
-            st.warning(
-                f"Confirmed as a filed officer ({row['ch_officer_name']}), but no "
-                f"shareholding is on the PSC register. The stake behind any figure "
-                f"above remains assumed."
-            )
-        elif present(row, "ch_company_number"):
-            st.warning(
-                f"Company matched on the register ({row['ch_company_number']}), but the "
-                f"individual does not appear in its filings. The stake remains assumed."
-            )
-        else:
-            st.warning(
-                "Not verified against a company register. The shareholding behind any "
-                "figure above is an assumption."
-            )
-
-        search_name = str(row["full_name"]).replace(" ", "+")
-        links = [
-            f"- [Companies House officer search]"
-            f"(https://find-and-update.company-information.service.gov.uk/search/officers?q={search_name})",
-            f"- [News search](https://news.google.com/search?q=%22{search_name}%22)",
-            f"- [LinkedIn search](https://www.linkedin.com/search/results/people/?keywords={search_name})"
-            " — manual only; this app never scrapes LinkedIn.",
-        ]
-        if present(row, "ch_profile_url"):
-            links.insert(0, f"- [Companies House company record]({row['ch_profile_url']})")
-        st.markdown("**Check it yourself**  \n" + "  \n".join(links))
-
-    st.divider()
-    _outreach_panel(row)
-    st.divider()
-    _pipeline_controls(row)
-
-
-def _outreach_panel(row: pd.Series) -> None:
-    """How to reach them, warmest route first — and what is deliberately absent."""
-    st.markdown("**How to reach them**")
-
-    record = {
-        key: (row[key] if present(row, key) else None)
-        for key in (
-            "full_name", "company", "known_adviser", "ch_registered_office", "address",
-            "ch_company_number", "ch_company_name", "ch_profile_url",
-        )
-    }
-    routes = contact_routes(record)
-
-    with db.connect() as conn:
-        history = [dict(r) for r in db.contacts(conn, int(row["id"]))]
-
-    if history:
-        st.warning(
-            f"**Already approached {len(history)} time(s)** — most recently "
-            f"{history[0]['created_at'][:10]} by {history[0]['channel'].lower()}"
-            + (f" ({history[0]['outcome']})" if history[0].get("outcome") else "")
-            + ". Check the log below before making contact again."
-        )
-
-    left, right = st.columns([1.6, 1])
-    with left:
-        # Numbered by position, not by the internal warmth rank — a record with no
-        # adviser and no filed address would otherwise start at "5." and look as
-        # though four routes had gone missing.
-        for position, route in enumerate(routes, start=1):
-            with st.container(border=True):
-                st.markdown(
-                    f"**{position}. {route.label}**"
-                    + (f"  ·  [open]({route.url})" if route.url else "")
-                )
-                st.markdown(
-                    f'<div class="reason">{route.detail}</div>', unsafe_allow_html=True
-                )
-                if route.caution:
-                    st.caption(f"⚠︎ {route.caution}")
-
-    with right:
-        st.markdown("**Log an approach**")
-        with st.form(f"contact_{int(row['id'])}"):
-            channel = st.selectbox(
-                "How", ["Introduction requested", "Letter", "Call", "Email to the company",
-                        "Met in person", "Event", "Other"],
-            )
-            route_used = st.selectbox(
-                "Route", ["—"] + [r.label for r in routes],
-            )
-            outcome = st.selectbox(
-                "Outcome", ["No reply yet", "Replied", "Meeting booked", "Declined",
-                            "Asked not to be contacted"],
-            )
-            note = st.text_area("Note", height=80)
-            who = st.text_input("Logged by")
-            if st.form_submit_button("Save to the contact log", type="primary"):
-                with db.connect() as conn:
-                    db.log_contact(conn, int(row["id"]), {
-                        "channel": channel,
-                        "route": None if route_used == "—" else route_used,
-                        "outcome": outcome, "note": note, "logged_by": who,
-                    })
-                    if outcome == "Asked not to be contacted":
-                        db.suppress_prospect(
-                            conn, int(row["id"]),
-                            f"Objected on contact — logged by {who or 'unknown'}.",
-                        )
-                refresh()
-                if outcome == "Asked not to be contacted":
-                    st.warning(
-                        "Recorded as an objection: this record is now suppressed and "
-                        "the weekly sweep will stop updating it."
-                    )
-                else:
-                    st.success("Logged.")
-
-        if history:
-            st.markdown("**Contact log**")
-            for entry in history:
-                st.markdown(
-                    f"- **{entry['created_at'][:10]}** {entry['channel']}"
-                    + (f" via {entry['route']}" if entry.get("route") else "")
-                    + (f" — {entry['outcome']}" if entry.get("outcome") else "")
-                    + (f"  \n  _{entry['note']}_" if entry.get("note") else "")
-                )
-
-    with st.expander("What this app will not look up, and why"):
-        for label, why in REFUSED_ROUTES:
-            st.markdown(f"**{label}** — {why}")
-
-
-def _pipeline_controls(row: pd.Series) -> None:
-    """The advisor's own notes. Kept separate from everything the pipeline derives."""
-    st.markdown("**Your pipeline notes**")
-    with st.form(f"pipeline_{int(row['id'])}"):
-        columns = st.columns([1, 1, 1])
-        statuses = ["New", "Researching", "Qualified", "Contacted", "In conversation",
-                    "Client", "Not a fit", "Parked"]
-        stages = ["Unaware", "Aware", "Engaged", "In discussion", "Proposal", "Onboarded"]
-        current_status = str(row["status"]) if present(row, "status") else "New"
-        current_stage = (
-            str(row["relationship_stage"]) if present(row, "relationship_stage") else "Unaware"
-        )
-        status = columns[0].selectbox(
-            "Lead status", statuses,
-            index=statuses.index(current_status) if current_status in statuses else 0,
-        )
-        stage = columns[1].selectbox(
-            "Relationship stage", stages,
-            index=stages.index(current_stage) if current_stage in stages else 0,
-        )
-        owner = columns[2].text_input(
-            "Owner", value=str(row["owner"]) if present(row, "owner") else "",
-        )
-        notes = st.text_area(
-            "Notes", value=str(row["notes"]) if present(row, "notes") else "", height=90,
-        )
-        if st.form_submit_button("Save", type="primary"):
-            with db.connect() as conn:
-                db.update_prospect(conn, int(row["id"]), {
-                    "status": status, "relationship_stage": stage,
-                    "owner": owner, "notes": notes,
-                })
-            refresh()
-            st.success("Saved.")
-
-    with st.expander("Remove this person from the list (data protection)"):
-        st.caption(
-            "Use this when someone objects to being profiled. The record is suppressed "
-            "rather than deleted, so the weekly sweep cannot find them again and "
-            "recreate them, and they are excluded from every total and report."
-        )
-        reason = st.text_input("Reason", key=f"suppress_reason_{int(row['id'])}")
-        if st.button("Suppress this record", key=f"suppress_{int(row['id'])}"):
-            with db.connect() as conn:
-                db.suppress_prospect(conn, int(row["id"]), reason or "No reason recorded")
-            refresh()
-            st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -1317,9 +839,8 @@ def page_overview(frame: pd.DataFrame) -> None:
 
     if frame.empty:
         st.info(
-            "**Nothing on file yet.** Open **Find prospects** in the sidebar and press "
-            "*Start searching* — the default settings sweep the UK, the United States "
-            "and the Middle East."
+            "**Nothing on file yet.** Open **Find prospects** and press *Start "
+            "searching* — the default sweeps Bristol, Bath, London and the South West."
         )
         return
 
@@ -1431,7 +952,7 @@ def page_overview(frame: pd.DataFrame) -> None:
             st.caption("No prospects with a resolved market yet.")
         else:
             try:
-                st.map(located[["lat", "lon"]], size=24000, color="#0f766e")
+                st.map(located[["lat", "lon"]], size=24000, color=ACCENT)
                 st.caption(
                     "Plotted at the centre of each market. Sources give a town or a "
                     "county, not a street address."
@@ -1738,7 +1259,7 @@ def page_methodology() -> None:
 2. **Reads publisher feeds.** Google News RSS plus a fixed list of UK regional, US
    and Gulf business publishers. Feeds only: no article bodies are scraped and no
    paywall is circumvented.
-3. **Locates each article.** Geography is resolved against all 70 markets and then
+3. **Locates each article.** Geography is resolved against all 69 markets and then
    checked against your selection. An article that positively names somewhere out of
    scope is discarded. An article that names nowhere at all inherits the market from
    the search that found it — flagged as *inferred*, and scored lower for it.
@@ -1760,7 +1281,7 @@ def page_methodology() -> None:
         pd.DataFrame([{
             "Depth": d.label,
             "Events": len(d.event_keys) or len(EVENT_TEMPLATES),
-            "Towns per market": d.places or "market name only",
+            "Towns per market": str(d.places) if d.places else "market name only",
             "Windows": ", ".join(f"{w}d" for w in d.windows),
             "What it is for": d.description,
         } for d in DEPTHS]),
@@ -1915,9 +1436,9 @@ can see and block it if they wish.
 
     st.subheader("Automating the weekly run")
     st.code(
-        "# macOS / Linux — 07:00 every Monday, deep sweep of UK + US + Middle East\n"
+        "# macOS / Linux — 07:00 every Monday, deep sweep of the target profile\n"
         "0 7 * * 1 cd /path/to/ca_dashboard && /usr/bin/python3 scripts/run_research.py "
-        "--if-due --depth deep --preset 'UK + US + Middle East' >> research.log 2>&1\n\n"
+        "--if-due --depth deep >> research.log 2>&1\n\n"
         "# Windows — Task Scheduler, weekly, Monday 07:00\n"
         "python C:\\path\\to\\ca_dashboard\\scripts\\run_research.py --if-due --depth deep",
         language="bash",
@@ -1950,58 +1471,79 @@ This describes how the software behaves; it is not legal advice.
 # Shell
 # ---------------------------------------------------------------------------
 
-frame = load_prospects()
+def _page(render, title: str):
+    """Each page behind its own error boundary.
 
-PAGES = {
-    "Overview": lambda: page_overview(frame),
-    "Prospect list": lambda: page_list(frame),
-    "Find prospects": lambda: page_find(frame),
-    "Find the owner": page_unnamed_leads,
-    "Screened out": page_screened_out,
-    "Weekly research document": page_research_doc,
-    "How it works": page_methodology,
-}
+    A fault in one page now shows as a contained message on that page; the
+    navigation, the other pages and the book are unaffected.
+    """
+    def run() -> None:
+        with guarded(f"The {title} page"):
+            render()
+    run.__name__ = f"page_{title.lower().replace(' ', '_').replace('&', 'and')}"
+    return run
 
-with st.sidebar:
-    st.markdown(
-        f'<div class="masthead"><span class="masthead-mark">◈</span>'
-        f'<span class="masthead-name">{APP_NAME}</span></div>'
-        f'<div class="masthead-rule"></div>',
-        unsafe_allow_html=True,
-    )
-    st.caption(APP_SUBTITLE)
 
-    # A fresh install has nothing to look at, so it opens on the page that fixes
-    # that rather than on an empty dashboard.
-    order = list(PAGES)
-    page = st.radio(
-        "Navigate", order,
-        index=order.index("Find prospects") if frame.empty else 0,
-        label_visibility="collapsed",
-    )
-
-    st.divider()
-    with db.connect() as conn:
-        latest = db.last_run(conn)
-        due = db.run_due_this_week(conn)
-
-    if latest:
-        st.caption(
-            f"Last sweep: {latest['started_at'][:10]} — {latest['status']}, "
-            f"{latest['new_prospects']} new"
+def _sidebar(frame: pd.DataFrame) -> None:
+    with st.sidebar:
+        masthead(APP_NAME, APP_SUBTITLE)
+        with db.connect() as conn:
+            latest = db.last_run(conn)
+            due = db.run_due_this_week(conn)
+        lines = []
+        if latest:
+            lines.append(
+                f"Last sweep {latest['started_at'][:10]} · {latest['status']} · "
+                f"{latest['new_prospects']} new"
+            )
+        else:
+            lines.append("No sweep has run yet.")
+        if due:
+            lines.append("⚠︎ This week's sweep is due.")
+        if not frame.empty:
+            lines.append(f"{len(frame)} people on file")
+        lines.append(
+            "Companies House: "
+            + ("connected ✓" if companies_house_available() else "not configured (optional)")
         )
-    else:
-        st.caption("No sweep has run yet.")
-    if due:
-        st.caption("⚠︎ This week's sweep is due.")
-    if not frame.empty:
-        st.caption(f"{len(frame)} people on file")
-    st.caption(
-        "Companies House: "
-        + ("connected ✓" if companies_house_available() else "not configured (optional)")
-    )
+        st.caption("  \n".join(lines))
 
-PAGES[page]()
+
+frame = load_prospects()
+_sidebar(frame)
+
+# A fresh install has nothing to look at, so it opens on the page that fixes
+# that rather than on an empty shortlist.
+empty = frame.empty
+navigation = st.navigation({
+    "Work": [
+        st.Page(_page(lambda: page_today(frame), "Today"), title="Today",
+                icon=":material/today:", url_path="today", default=not empty),
+        st.Page(_page(lambda: page_list(frame), "Prospect list"), title="Prospect list",
+                icon=":material/table_rows:", url_path="prospects"),
+        st.Page(_page(page_unnamed_leads, "Find the owner"), title="Find the owner",
+                icon=":material/person_search:", url_path="find-the-owner"),
+    ],
+    "Research": [
+        st.Page(_page(lambda: page_find(frame), "Find prospects"), title="Find prospects",
+                icon=":material/travel_explore:", url_path="find", default=empty),
+        st.Page(_page(page_workbench, "Add & import"), title="Add & import",
+                icon=":material/upload_file:", url_path="add"),
+        st.Page(_page(lambda: page_overview(frame), "Overview"), title="Overview",
+                icon=":material/insights:", url_path="overview"),
+        st.Page(_page(page_research_doc, "Weekly research document"),
+                title="Weekly document", icon=":material/description:", url_path="weekly"),
+    ],
+    "About": [
+        st.Page(_page(page_screened_out, "Screened out"), title="Screened out",
+                icon=":material/block:", url_path="screened-out"),
+        st.Page(_page(page_methodology, "How it works"), title="How it works",
+                icon=":material/menu_book:", url_path="how-it-works"),
+        st.Page(_page(page_system, "System check"), title="System check",
+                icon=":material/monitor_heart:", url_path="system"),
+    ],
+})
+navigation.run()
 
 st.divider()
 st.caption(

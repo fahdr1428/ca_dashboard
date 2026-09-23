@@ -22,7 +22,7 @@ from . import db
 from .evidence import classify_source, grade_record
 from .exclusions import screen
 from .legitimacy import assess, refuse_by_role
-from .extract import ExtractedEvent, extract_event
+from .extract import ExtractedEvent, extract_event, extract_landholding
 from .markets import MARKET_BY_KEY, expand_selection
 from .outreach import extract_advisers
 from .sectors import classify as classify_sector
@@ -384,6 +384,11 @@ def _refresh_corroboration(conn, prospect_id: int) -> None:
         ownership_filed=bool(row["ch_ownership_band"]),
         text=" ".join(s.get("title") or "" for s in sources),
         trusted_publisher=trusted,
+        landholding=(
+            extract_landholding(" ".join(
+                f"{s.get('title') or ''}. {s.get('excerpt') or ''}" for s in sources))
+            if row["wealth_source"] == WEALTH_SOURCE["land_sale"] else None
+        ),
     )
     grade, basis = grade_record(sources)
     conn.execute(
@@ -423,6 +428,9 @@ WEALTH_SOURCE: dict[str, str] = {
     "property": "Property",
     "rich_list": "Rich-list inclusion",
 }
+
+#: Events whose vehicle is land, verified at HM Land Registry rather than Companies House.
+LAND_EVENTS = frozenset({"land_sale", "landholding"})
 
 def _advisers_text(event: ExtractedEvent) -> str | None:
     """The professional firms the announcement names, as one readable line.
@@ -603,6 +611,10 @@ def _store_person(
             ownership_filed=stake_verified,
             text=f"{event.title}. {event.summary}",
             trusted_publisher=trusted,
+            landholding=(
+                extract_landholding(f"{event.title}. {event.summary}")
+                if event.event_key in LAND_EVENTS else None
+            ),
         )
         sector = classify_sector(
             sic_codes=list(ch_match.sic_codes) if ch_match else None,
