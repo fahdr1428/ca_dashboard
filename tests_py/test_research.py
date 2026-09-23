@@ -462,11 +462,19 @@ class TestQueries(unittest.TestCase):
     def test_towns_are_or_ed_rather_than_searched_separately(self):
         """Recall without a request per town — the whole reason a deep sweep is
         affordable at all."""
+        from wealthscan.queries import PLACE_TERM_BUDGET, count_terms
         blocks = place_blocks("uk-devon", places=6, block_size=7)
-        self.assertEqual(len(blocks), 1)
         self.assertIn('"Devon"', blocks[0])
         self.assertIn(" OR ", blocks[0])
         self.assertIn('"Exeter"', blocks[0])
+        self.assertLess(len(blocks), 7, "towns are grouped, not one query each")
+        for block in blocks:
+            self.assertLessEqual(count_terms(block), PLACE_TERM_BUDGET)
+        # Every requested town is in some block.
+        joined = " ".join(blocks)
+        from wealthscan.markets import MARKET_BY_KEY
+        for town in MARKET_BY_KEY["uk-devon"].places[:7]:
+            self.assertIn(f'"{town}"', joined)
 
     def test_market_name_only_when_no_towns_requested(self):
         self.assertEqual(place_blocks("uk-devon", places=0, block_size=7), ['"Devon"'])
@@ -489,9 +497,44 @@ class TestQueries(unittest.TestCase):
         matrix = build_search_matrix(
             market_keys=["uk-devon"], depth="quick", event_keys=["business_exit"]
         )
-        self.assertEqual(len(matrix), 1)
-        self.assertEqual(matrix[0].market_key, "uk-devon")
-        self.assertEqual(matrix[0].event_key, "business_exit")
+        self.assertTrue(matrix)
+        self.assertEqual({q.market_key for q in matrix}, {"uk-devon"})
+        self.assertEqual({q.event_key for q in matrix}, {"business_exit"})
+
+    def test_no_query_exceeds_the_term_limit(self):
+        """Google ignores every term after the 32nd, silently. Half the queries
+        used to run past it — and for the acquisition template the part lost was
+        the "founder OR owner" clause that makes a result name a person."""
+        from wealthscan.queries import QUERY_TERM_LIMIT, count_terms
+        for depth in DEPTHS:
+            for query in build_search_matrix(market_keys=list(PRESETS["Everywhere"]),
+                                             depth=depth.key):
+                # +1 for the when:Nd operator added to the URL.
+                self.assertLessEqual(
+                    count_terms(query.query) + 1, QUERY_TERM_LIMIT, query.query
+                )
+
+    def test_packing_loses_no_search_phrase(self):
+        """Fitting the limit by splitting is only acceptable if nothing is
+        dropped: every alternative of every template must still be asked."""
+        from wealthscan.queries import template_groups
+        for template in EVENT_TEMPLATES:
+            queries = " ".join(
+                q.query for q in build_search_matrix(
+                    market_keys=["uk-devon"], depth="deep", event_keys=[template.key])
+            )
+            for group in template_groups(template.phrase):
+                for alternative in group:
+                    self.assertIn(alternative, queries, f"{template.key}: {alternative}")
+
+    def test_constraints_survive_every_split(self):
+        """The acquisition template's person clause is a constraint, not an
+        alternative. Splitting must copy it into every query, not share it out."""
+        queries = build_search_matrix(
+            market_keys=["uk-devon"], depth="deep", event_keys=["acquisition"])
+        self.assertGreater(len(queries), 1)
+        for query in queries:
+            self.assertIn("founder OR owner", query.query)
 
 
 class TestFormatting(unittest.TestCase):
@@ -836,6 +879,78 @@ class TestGoogleNewsFeed(unittest.TestCase):
                 self.assertFalse(any("Manchester" in (r["rationale"] or "")
                                      for r in people.values()))
             self.assertGreaterEqual(result.rejected, 1)
+
+
+class TestSourceReliability(unittest.TestCase):
+    """A run should report a problem once and act on it, not repeat it forever."""
+
+    def test_a_dead_feed_is_rested_then_retried(self):
+        from datetime import datetime, timedelta, timezone
+        with TempBook() as db:
+            url = "https://example.invalid/feed"
+            with db.connect() as conn:
+                for _ in range(db.FEED_FAILURE_LIMIT):
+                    self.assertIsNone(db.feed_should_skip(conn, url))
+                    db.record_feed_result(conn, url, name="Example", ok=False,
+                                          error="HTTP 404")
+                self.assertIsNotNone(db.feed_should_skip(conn, url), "rested")
+
+                # After the retry interval it is given another chance.
+                old = (datetime.now(timezone.utc)
+                       - timedelta(days=db.FEED_RETRY_DAYS + 1)).isoformat()
+                conn.execute("UPDATE feed_health SET last_fail = ? WHERE url = ?",
+                             (old, url))
+                self.assertIsNone(db.feed_should_skip(conn, url), "retried")
+
+                # One success clears the record entirely.
+                db.record_feed_result(conn, url, name="Example", ok=True, items=12)
+                row = conn.execute("SELECT * FROM feed_health WHERE url = ?",
+                                   (url,)).fetchone()
+                self.assertEqual(row["consecutive_failures"], 0)
+
+    def test_repeated_google_refusals_stop_the_run(self):
+        """Twelve refusals in a row is being rate-limited, not bad luck. The
+        run must stop and say so, not spend a quarter of an hour collecting
+        failures and teaching Google the client does not back off."""
+        from wealthscan import research
+        calls = []
+
+        def refuse(fetcher, url, *, publisher=""):
+            calls.append(url)
+            return [], f"{publisher}: HTTP 429"
+
+        original = research.fetch_feed
+        research.fetch_feed = refuse
+        try:
+            with TempBook():
+                result = research.run_research(
+                    market_keys=["uk-devon"], depth="standard", include_publishers=False,
+                )
+        finally:
+            research.fetch_feed = original
+
+        self.assertTrue(result.stopped_early)
+        self.assertEqual(len(calls), research.GOOGLE_FAILURE_LIMIT)
+        self.assertTrue(any("consecutive Google News failures" in w for w in result.warnings))
+
+    def test_only_confirmed_feeds_are_read_directly(self):
+        from wealthscan.queries import DIRECT_FEEDS
+        self.assertTrue(DIRECT_FEEDS)
+        for name, url in DIRECT_FEEDS:
+            self.assertTrue(url.startswith("https://"), name)
+
+    def test_specialist_publishers_are_searched_with_a_market(self):
+        """Site sweeps carry a market, so a result that names no place still
+        has one — which is what a bare publisher feed could never give."""
+        from wealthscan.queries import SITE_SWEEPS, build_site_sweeps, count_terms
+        sweeps = build_site_sweeps(market_keys=["uk-devon", "uk-cornwall"])
+        self.assertEqual(len(sweeps), 2 * len(SITE_SWEEPS))
+        for query in sweeps:
+            self.assertIn("site:", query.query)
+            self.assertIn(query.market_key, {"uk-devon", "uk-cornwall"})
+            self.assertLessEqual(count_terms(query.query) + 1, 32)
+        self.assertTrue(any("fwi.co.uk" in q.query for q in sweeps),
+                        "land sales are searched deliberately")
 
 
 class TestLegitimacy(unittest.TestCase):

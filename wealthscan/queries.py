@@ -21,6 +21,7 @@ Two things drive yield, and both are set here:
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from urllib.parse import quote_plus
 
@@ -248,27 +249,32 @@ DEPTHS: tuple[Depth, ...] = (
     ),
     Depth(
         "standard", "Standard sweep",
-        "All 14 wealth events, with the main towns in each market folded into the "
-        "queries. The normal weekly run.",
+        "Every wealth event, with the main towns in each market folded into the "
+        "queries, over the last month. The normal weekly run.",
         (), (30,), 6, 7, True,
     ),
     Depth(
         "deep", "Deep search",
-        "All events, every town in each market, and both a recent and a wider "
-        "window. This is the setting to use when you want volume.",
-        (), (7, 90), 14, 7, True,
+        "Every event, every town in each market, over the last three months. The "
+        "setting to use when you want the fullest list.",
+        # One 90-day window rather than a 7-day and a 90-day pair: the wider
+        # window already contains the narrower one, so the second pass mostly
+        # re-read the same items and doubled the run time for little.
+        (), (90,), 14, 7, True,
     ),
     Depth(
         "exhaustive", "Exhaustive",
-        "Everything the app knows how to ask, over three windows. Leave it running.",
-        (), (7, 30, 180), 24, 5, True,
+        "Everything the app knows how to ask, over the last month and the last "
+        "year. Builds a backlog on a first run; leave it going.",
+        (), (30, 365), 24, 5, True,
     ),
 )
 
 DEPTH_BY_KEY: dict[str, Depth] = {d.key: d for d in DEPTHS}
-#: Standard over a multi-market preset is roughly ten minutes of searching, which
-#: is the point where yield stops improving much per minute spent.
-DEFAULT_DEPTH = "standard"
+#: Deep over the target-profile preset is about a quarter of an hour: the point
+#: where an advisor who asked for quality over speed still gets a result the
+#: same morning.
+DEFAULT_DEPTH = "deep"
 
 
 # ---------------------------------------------------------------------------
@@ -304,12 +310,37 @@ def google_news_url(
     )
 
 
-def place_blocks(market_key: str, *, places: int, block_size: int) -> list[str]:
+#: Google web search ignores every term after the 32nd, silently. Assumed to
+#: hold for News as well: the cost of assuming it and being wrong is a few more
+#: requests; the cost of ignoring it and being right is that half the queries
+#: lose their tails — which, for the acquisition template, is the "founder OR
+#: owner" clause that makes a result name a person.
+QUERY_TERM_LIMIT = 32
+#: Terms a place block may use, leaving room for the event phrase.
+PLACE_TERM_BUDGET = 9
+
+
+def count_terms(query: str) -> int:
+    """Terms as Google counts them: words, including OR, excluding brackets."""
+    return len(query.replace("(", " ").replace(")", " ").split())
+
+
+def _group(alternatives: list[str] | tuple[str, ...]) -> str:
+    joined = " OR ".join(alternatives)
+    return f"({joined})" if len(alternatives) > 1 else joined
+
+
+def place_blocks(
+    market_key: str, *, places: int, block_size: int,
+    term_budget: int = PLACE_TERM_BUDGET,
+) -> list[str]:
     """Query fragments naming the market and, optionally, its towns.
 
     Towns are OR-ed together rather than searched one at a time. A single
     `("Devon" OR "Exeter" OR "Plymouth" OR "Torbay")` query finds everything four
-    separate queries would, for a quarter of the requests.
+    separate queries would, for a quarter of the requests. Blocks are packed by
+    term count rather than place count, because "Weston-super-Mare" and "Bath"
+    do not cost the same.
     """
     market = MARKET_BY_KEY.get(market_key)
     if market is None or not market.places:
@@ -324,11 +355,66 @@ def place_blocks(market_key: str, *, places: int, block_size: int) -> list[str]:
         names += [p for p in market.places[1:][:places]]
 
     blocks: list[str] = []
-    for start in range(0, len(names), block_size):
-        chunk = names[start:start + block_size]
-        joined = " OR ".join(f'"{name}"' for name in chunk)
-        blocks.append(f"({joined})" if len(chunk) > 1 else joined)
+    current: list[str] = []
+    for name in names:
+        candidate = current + [f'"{name}"']
+        if current and (
+            len(candidate) > block_size or count_terms(_group(candidate)) > term_budget
+        ):
+            blocks.append(_group(current))
+            current = [f'"{name}"']
+        else:
+            current = candidate
+    if current:
+        blocks.append(_group(current))
     return blocks
+
+
+def template_groups(phrase: str) -> list[list[str]]:
+    """A template phrase as its AND-ed groups, each a list of OR-ed alternatives."""
+    groups = [
+        [alt.strip() for alt in re.split(r"\s+OR\s+", body) if alt.strip()]
+        for body in re.findall(r"\(([^()]*)\)", phrase)
+    ]
+    return groups or [[phrase.strip()]]
+
+
+def fit_queries(block: str, phrase: str, *, limit: int = QUERY_TERM_LIMIT) -> list[str]:
+    """Every alternative in the phrase, packed into queries that fit the limit.
+
+    The largest OR-group is split across as many queries as it takes; the other
+    groups — the constraints — are kept whole in every one, because dropping a
+    constraint changes what the query means rather than just how much it asks.
+    """
+    groups = template_groups(phrase)
+    split_at = max(range(len(groups)), key=lambda i: count_terms(_group(groups[i])))
+    fixed = [g for i, g in enumerate(groups) if i != split_at]
+    # One term for the when:Nd operator appended at request time.
+    budget = (
+        limit - 1 - count_terms(block)
+        - sum(count_terms(_group(g)) for g in fixed)
+    )
+
+    chunks: list[list[str]] = []
+    current: list[str] = []
+    for alternative in groups[split_at]:
+        candidate = current + [alternative]
+        if current and count_terms(_group(candidate)) > budget:
+            chunks.append(current)
+            current = [alternative]
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+
+    queries = []
+    for chunk in chunks:
+        parts = [
+            _group(chunk) if i == split_at else _group(groups[i])
+            for i in range(len(groups))
+        ]
+        queries.append(f"{block} {' '.join(parts)}")
+    return queries
 
 
 def build_search_matrix(
@@ -360,18 +446,18 @@ def build_search_matrix(
         blocks = place_blocks(key, places=settings.places, block_size=settings.block_size)
         for block in blocks:
             for template in templates:
-                for window in windows:
-                    query = f"{block} {template.phrase}"
-                    matrix.append(
-                        SearchQuery(
-                            market_key=key,
-                            market_name=market.name,
-                            event_key=template.key,
-                            query=query,
-                            url=google_news_url(query, days=window, market_key=key),
-                            window_days=window,
+                for query in fit_queries(block, template.phrase):
+                    for window in windows:
+                        matrix.append(
+                            SearchQuery(
+                                market_key=key,
+                                market_name=market.name,
+                                event_key=template.key,
+                                query=query,
+                                url=google_news_url(query, days=window, market_key=key),
+                                window_days=window,
+                            )
                         )
-                    )
     return matrix
 
 
@@ -416,10 +502,14 @@ def plan_sweep(
     count = len(matrix)
     if max_queries:
         count = min(count, max_queries)
-    publishers = PUBLISHER_FEEDS if (
+    publishers_on = (
         settings.include_publishers if include_publishers is None else include_publishers
-    ) else ()
-    count += len(publishers)
+    )
+    if publishers_on:
+        count += len(DIRECT_FEEDS)
+        count += len(build_site_sweeps(
+            market_keys=market_keys, days=days or max(settings.windows)
+        ))
 
     return Plan(
         queries=count,
@@ -432,32 +522,80 @@ def plan_sweep(
     )
 
 
-#: Business publishers swept broadly in addition to the targeted queries. These
-#: carry deal news that never reaches national aggregation, and between them
-#: cover the UK regions, the US, the Gulf and Asia.
-PUBLISHER_FEEDS: tuple[tuple[str, str], ...] = (
-    # United Kingdom
-    ("BusinessLive South West", "https://www.business-live.co.uk/west-country/?service=rss"),
-    ("BusinessLive South East", "https://www.business-live.co.uk/south-east/?service=rss"),
-    ("BusinessLive National", "https://www.business-live.co.uk/?service=rss"),
-    ("Insider Media South West", "https://www.insidermedia.com/rss/southwest"),
-    ("Insider Media South East", "https://www.insidermedia.com/rss/southeast"),
-    ("UKTN", "https://www.uktech.news/feed"),
-    ("The Business Magazine", "https://thebusinessmagazine.co.uk/feed/"),
-    ("Bdaily", "https://bdaily.co.uk/rss"),
+#: Publisher feeds read directly, for their standfirsts — Google News returns
+#: headlines only, and a standfirst is where an owner's name and the adviser on a
+#: deal usually appear. Only feeds whose address is confirmed are listed: every
+#: guessed URL is a warning on every run, and a list of warnings trains people to
+#: ignore warnings.
+DIRECT_FEEDS: tuple[tuple[str, str], ...] = (
+    ("BusinessLive", "https://www.business-live.co.uk/?service=rss"),
     ("BBC Business", "https://feeds.bbci.co.uk/news/business/rss.xml"),
     ("Sky News Business", "https://feeds.skynews.com/feeds/rss/business.xml"),
-    # United States
-    ("Reuters Deals", "https://news.google.com/rss/search?q=site:reuters.com+(acquires+OR+%22sells+stake%22)&hl=en-US&gl=US&ceid=US:en"),
-    ("Axios Pro Rata", "https://api.axios.com/feed/pro-rata"),
-    ("TechCrunch", "https://techcrunch.com/feed/"),
-    ("Forbes Billionaires", "https://www.forbes.com/billionaires/feed/"),
-    # Middle East
-    ("Arabian Business", "https://www.arabianbusiness.com/feed"),
-    ("Zawya Deals", "https://www.zawya.com/en/rss/deals"),
-    ("Gulf Business", "https://gulfbusiness.com/feed/"),
-    ("The National Business", "https://www.thenationalnews.com/arc/outboundfeeds/rss/category/business/"),
-    # Wider
-    ("Private Equity Wire", "https://www.privateequitywire.co.uk/feed/"),
-    ("Family Capital", "https://www.famcap.com/articles?format=rss"),
 )
+
+#: Kept under its old name for the parts of the app that count feeds.
+PUBLISHER_FEEDS = DIRECT_FEEDS
+
+
+@dataclass(frozen=True)
+class SiteSweep:
+    """A specialist publisher, reached through a site-scoped Google News search.
+
+    For publishers whose feed address cannot be confirmed, this is strictly
+    better than guessing one: it uses an endpoint already known to work, and it
+    carries a market context, so a result that names no place still has one.
+    """
+
+    name: str
+    domain: str
+    phrase: str
+    event_key: str
+
+
+SITE_SWEEPS: tuple[SiteSweep, ...] = (
+    SiteSweep(
+        "Insider Media", "insidermedia.com",
+        '(acquired OR "management buyout" OR sold OR "takes stake" OR exit)',
+        "acquisition",
+    ),
+    SiteSweep(
+        "Business Leader", "businessleader.co.uk",
+        '(acquired OR sold OR exit OR buyout OR "sells stake")',
+        "business_exit",
+    ),
+    SiteSweep(
+        "Real Deals", "realdeals.eu.com",
+        '(backs OR acquires OR exit OR buyout OR "secondary buyout")',
+        "private_equity",
+    ),
+    # Land and estate sales — the wealth a deal-news sweep otherwise never sees,
+    # and the category the brief singled out as under-covered.
+    SiteSweep(
+        "Farmers Weekly", "fwi.co.uk",
+        '(farmland OR estate OR acres) (sold OR sale OR buyer OR "changed hands")',
+        "land_sale",
+    ),
+)
+
+
+def build_site_sweeps(
+    *,
+    market_keys: tuple[str, ...] | list[str] | None = None,
+    days: int = 90,
+) -> list[SearchQuery]:
+    """One site-scoped search per specialist publisher per market."""
+    queries: list[SearchQuery] = []
+    for key in expand_selection(market_keys):
+        market = MARKET_BY_KEY[key]
+        block = place_blocks(key, places=0, block_size=1)[0]
+        for sweep in SITE_SWEEPS:
+            query = f"site:{sweep.domain} {block} {sweep.phrase}"
+            queries.append(SearchQuery(
+                market_key=key,
+                market_name=market.name,
+                event_key=sweep.event_key,
+                query=query,
+                url=google_news_url(query, days=days, market_key=key),
+                window_days=days,
+            ))
+    return queries

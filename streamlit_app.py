@@ -368,7 +368,8 @@ def page_find(frame: pd.DataFrame) -> None:
                  "again continues where this left off.",
         )
         publishers = options[2].checkbox(
-            f"Also sweep {len(PUBLISHER_FEEDS)} business publishers",
+            f"Also search specialist publishers (Insider Media, Business Leader, "
+            f"Real Deals, Farmers Weekly) and {len(PUBLISHER_FEEDS)} direct feeds",
             value=DEPTH_BY_KEY[depth].include_publishers,
             help="UK regional, US, and Gulf business press. These carry deal news that "
                  "never reaches national aggregation.",

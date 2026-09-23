@@ -213,6 +213,19 @@ CREATE TABLE IF NOT EXISTS contacts (
 );
 CREATE INDEX IF NOT EXISTS idx_contacts_prospect ON contacts(prospect_id);
 
+-- Per-feed reliability. A feed that has failed three runs running is skipped
+-- for a week rather than reported as a failure on every sweep: a list of the
+-- same warnings every Monday trains people to stop reading warnings.
+CREATE TABLE IF NOT EXISTS feed_health (
+    url                  TEXT PRIMARY KEY,
+    name                 TEXT,
+    last_ok              TEXT,
+    last_fail            TEXT,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    last_error           TEXT,
+    items_last_ok        INTEGER NOT NULL DEFAULT 0
+);
+
 -- Refusals, kept rather than discarded. A screening rule you cannot inspect is
 -- indistinguishable from a bug, and "why is nobody from Hampshire showing up"
 -- is only answerable if the rejections are on record.
@@ -584,6 +597,58 @@ def contacted_ids(conn: sqlite3.Connection) -> set[int]:
         int(r["prospect_id"])
         for r in conn.execute("SELECT DISTINCT prospect_id FROM contacts")
     }
+
+
+FEED_FAILURE_LIMIT = 3
+FEED_RETRY_DAYS = 7
+
+
+def feed_should_skip(conn: sqlite3.Connection, url: str) -> str | None:
+    """Why a feed is being rested, or None if it should be tried."""
+    row = conn.execute("SELECT * FROM feed_health WHERE url = ?", (url,)).fetchone()
+    if row is None or row["consecutive_failures"] < FEED_FAILURE_LIMIT:
+        return None
+    try:
+        last = datetime.fromisoformat(row["last_fail"])
+    except (TypeError, ValueError):
+        return None
+    age = (datetime.now(timezone.utc) - last).days
+    if age >= FEED_RETRY_DAYS:
+        return None
+    return (
+        f"{row['name'] or url}: failed {row['consecutive_failures']} runs running "
+        f"({row['last_error'] or 'no detail'}); resting until it has had "
+        f"{FEED_RETRY_DAYS} days to recover."
+    )
+
+
+def record_feed_result(
+    conn: sqlite3.Connection, url: str, *, name: str, ok: bool,
+    error: str | None = None, items: int = 0,
+) -> None:
+    if ok:
+        conn.execute(
+            """INSERT INTO feed_health (url, name, last_ok, consecutive_failures, items_last_ok)
+               VALUES (?, ?, ?, 0, ?)
+               ON CONFLICT(url) DO UPDATE SET name = excluded.name,
+                 last_ok = excluded.last_ok, consecutive_failures = 0,
+                 last_error = NULL, items_last_ok = excluded.items_last_ok""",
+            (url, name, now_iso(), items),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO feed_health (url, name, last_fail, consecutive_failures, last_error)
+               VALUES (?, ?, ?, 1, ?)
+               ON CONFLICT(url) DO UPDATE SET name = excluded.name,
+                 last_fail = excluded.last_fail,
+                 consecutive_failures = feed_health.consecutive_failures + 1,
+                 last_error = excluded.last_error""",
+            (url, name, now_iso(), (error or "")[:300]),
+        )
+
+
+def feed_health(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM feed_health ORDER BY name").fetchall()
 
 
 def record_exclusion(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:

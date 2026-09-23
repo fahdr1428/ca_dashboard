@@ -30,8 +30,9 @@ from .queries import (
     DEFAULT_DEPTH,
     DEPTH_BY_KEY,
     EVENT_BY_KEY,
-    PUBLISHER_FEEDS,
+    DIRECT_FEEDS,
     build_search_matrix,
+    build_site_sweeps,
 )
 from .scoring import (
     TRUSTED_PUBLISHERS,
@@ -49,6 +50,9 @@ from .sources import (
 
 #: ``(message, fraction_complete)``
 ProgressCallback = Callable[[str, float], None]
+
+#: Consecutive Google News failures that end a run early.
+GOOGLE_FAILURE_LIMIT = 12
 
 
 @dataclass
@@ -114,7 +118,14 @@ def run_research(
         (q.url, "Google News", q.event_key, q.market_key) for q in matrix
     ]
     if publishers_on:
-        feeds += [(url, name, None, None) for name, url in PUBLISHER_FEEDS]
+        # Specialist publishers through site-scoped Google searches — each with
+        # a market context — then the directly-read feeds, for their standfirsts.
+        feeds += [
+            (q.url, "Google News", q.event_key, q.market_key)
+            for q in build_site_sweeps(
+                market_keys=markets, days=days or max(settings.windows))
+        ]
+        feeds += [(url, name, None, None) for name, url in DIRECT_FEEDS]
 
     with db.connect() as conn:
         run_id = db.start_run(conn, trigger, depth=depth, markets=list(markets),
@@ -125,6 +136,7 @@ def run_research(
         depth=depth, markets=tuple(markets), queries_planned=len(feeds),
     )
     ch_disabled_reason: str | None = None
+    google_failures = 0
 
     for index, (url, publisher, event_key, market_key) in enumerate(feeds):
         if time_budget_seconds is not None:
@@ -147,15 +159,45 @@ def run_research(
                 (index + 1) / max(len(feeds), 1),
             )
 
+        direct = publisher != "Google News"
+        if direct:
+            with db.connect() as conn:
+                resting = db.feed_should_skip(conn, url)
+            if resting:
+                if resting not in result.warnings:
+                    result.warnings.append(resting)
+                continue
+
         articles, warning = fetch_feed(fetcher, url, publisher=publisher)
         result.queries_run += 1
+        if direct:
+            with db.connect() as conn:
+                db.record_feed_result(conn, url, name=publisher, ok=not warning,
+                                      error=warning, items=len(articles))
         if warning:
             # One line per failing host, not per query: a blocked publisher would
             # otherwise fill the log with hundreds of identical entries.
             host = warning.split(":")[0]
             if not any(w.startswith(host) for w in result.warnings):
                 result.warnings.append(warning)
+            if not direct:
+                google_failures += 1
+                # Twelve Google failures in a row is not bad luck, it is being
+                # rate-limited or blocked. Carrying on spends the rest of the run
+                # collecting failures and teaches Google the client does not stop.
+                if google_failures >= GOOGLE_FAILURE_LIMIT:
+                    result.stopped_early = True
+                    result.warnings.append(
+                        f"Stopped after {google_failures} consecutive Google News "
+                        f"failures — the search endpoint is refusing this server "
+                        f"(last error: {warning}). Everything found so far is saved. "
+                        f"Try again in an hour; if it persists, the host's IP is "
+                        f"being blocked and the sweep needs to run from elsewhere."
+                    )
+                    break
             continue
+        if not direct:
+            google_failures = 0
 
         result.articles_seen += sum(1 + len(a.related) for a in articles)
 
