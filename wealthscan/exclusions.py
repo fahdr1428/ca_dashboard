@@ -111,7 +111,8 @@ _CELEBRITY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 EXCLUDED_TITLES: frozenset[str] = frozenset({
     "actor", "actress", "singer", "musician", "rapper", "comedian",
     "presenter", "broadcaster", "footballer", "athlete", "jockey", "boxer",
-    "golfer", "dj", "influencer", "youtuber", "model",
+    "golfer", "dj", "influencer", "youtuber", "model", "animator", "film-maker",
+    "filmmaker", "director of photography", "songwriter", "novelist", "author",
 })
 
 

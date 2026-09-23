@@ -614,6 +614,230 @@ class TestPeopleFirst(unittest.TestCase):
         self.assertEqual(_titlecase_filed_name("SMITH-JONES, Peter"), "Peter Smith-Jones")
 
 
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+class TempBook:
+    """A throwaway database for pipeline tests, patched in and restored after."""
+
+    def __enter__(self):
+        import tempfile
+        from wealthscan import db
+        self._dir = tempfile.TemporaryDirectory()
+        self._original = db.DB_PATH
+        db.DB_PATH = Path(self._dir.name) / "book.db"
+        db.init_db()
+        return db
+
+    def __exit__(self, *exc):
+        from wealthscan import db
+        db.DB_PATH = self._original
+        self._dir.cleanup()
+
+
+def _run_fixture(name: str, *, market_key: str, event_key: str, markets):
+    """Push a recorded feed through the same per-article path the sweep uses."""
+    from wealthscan.research import RunResult, process_article
+    from wealthscan.sources import Fetcher, parse_feed
+
+    result = RunResult(run_id=0, week="2026-W39", status="running")
+    fetcher = Fetcher(delay=0.0)
+    for article in parse_feed((FIXTURES / name).read_text(), default_publisher="Google News"):
+        outcome = process_article(
+            article, result=result, fetcher=fetcher, publisher="Google News",
+            event_key=event_key, market_key=market_key, markets=markets, verify_ch=False,
+        )
+        cluster = list((outcome or {}).get("prospect_ids", []))
+        for sibling in article.related:
+            process_article(
+                sibling, result=result, fetcher=fetcher, publisher="Google News",
+                event_key=event_key, market_key=market_key, markets=markets,
+                verify_ch=False, cluster_ids=cluster,
+            )
+    return result
+
+
+class TestHeadlineExtraction(unittest.TestCase):
+    """Google News gives headlines and nothing else, so the headline has to do
+    all the work. These corpora are the shapes regional business press actually
+    prints."""
+
+    COMPANIES = [
+        ("Founder Gareth Halberton sells Halberton Precision for £64m", "Halberton Precision"),
+        ("Halberton Precision bought by Schmidt Gruppe as founder exits", "Halberton Precision"),
+        ("Exeter engineering firm acquired by German rival in £64m deal", None),
+        ("Bristol software firm Kinetic Data sold to US buyer", "Kinetic Data"),
+        ("Private equity backs Somerset cider maker Thatchers", "Thatchers"),
+        ("Acquisition of Cotswold Provisions completes", "Cotswold Provisions"),
+        ("Castore founders Tom and Phil Beahon plan US expansion", "Castore"),
+        ("Rengen founder Iestyn Lewis sells student property stake", "Rengen"),
+        ("Dale Vince's Ecotricity reports record year", "Ecotricity"),
+        ("Owner of Plymouth's Mount Batten Boatworks sells up", "Mount Batten Boatworks"),
+        ("Devon family business Ashford Dairies acquired by Arla", "Ashford Dairies"),
+        ("Arla buys Devon dairy Ashford Dairies", "Ashford Dairies"),
+        ("Thales acquires Bath-based Coda Octopus", "Coda Octopus"),
+        ("Gloucestershire's Kemble Aero sold in £30m deal", "Kemble Aero"),
+        ("Sale of Truro-based Kernow Holidays to Parkdean completes", "Kernow Holidays"),
+        ("Quantock Energy Ltd sold to Meridian for £73m", "Quantock Energy Ltd"),
+        ("Management buyout at Wessex Tooling backed by Maven", "Wessex Tooling"),
+        ("Bristol Software Firm Kinetic Data Sold To US Buyer", "Kinetic Data"),
+        ("Private equity firm takes stake in Oxford biotech Wytham Bio", "Wytham Bio"),
+        ("Meridian Capital acquires majority stake in Solent Semiconductor",
+         "Solent Semiconductor"),
+        ("Swindon-based Arkell's Brewery sold to rival", "Arkell's Brewery"),
+        ("Hampshire housebuilder Foreman Homes agrees sale", "Foreman Homes"),
+        ("John Pellow's Cornish holiday park sold for £18m", None),
+        ("US Firm Sold for £40m", None),
+    ]
+
+    NOBODY = [
+        "Exeter engineering firm acquired by German rival in £64m deal",
+        "Cornwall hotel group sold in management buyout",
+        "Bristol Water Sold To Canadian Pension Fund",
+        "Private Equity House Backs Devon Manufacturer",
+        "Somerset Council Approves New Business Park",
+        "Great Western Railway Reports Record Passengers",
+        "Kinetic Data Sold To US Buyer",
+        "Cotswold Provisions Completes Acquisition",
+        "West Country Business Awards Winners Announced",
+        "New Forest Estate Sold To Private Buyer",
+        "Salisbury Plain Farmland Sells For £12m",
+        "Dartmoor National Park Buys Farm",
+        "Marks and Spencer reports record profits",
+        "Sarah's birthday party was fun",
+    ]
+
+    def test_companies_come_from_the_target_position(self):
+        from wealthscan.extract import reconcile
+        wrong = []
+        for headline, expected in self.COMPANIES:
+            got = reconcile(headline)[1]
+            if got != expected:
+                wrong.append(f"{headline!r}: got {got!r}, want {expected!r}")
+        self.assertEqual(wrong, [])
+
+    def test_the_buyer_is_never_taken_for_the_company(self):
+        """"Meridian Capital acquires … Solent Semiconductor" is a story about
+        the seller's business. The old suffix pattern matched "Capital" and
+        attached the buyer to the seller's founder."""
+        from wealthscan.extract import reconcile
+        self.assertEqual(
+            reconcile("Meridian Capital acquires majority stake in Solent Semiconductor")[1],
+            "Solent Semiconductor",
+        )
+
+    def test_companies_are_not_people(self):
+        """"Kinetic Data sold to US buyer" has exactly the shape of "Gareth
+        Halberton sold…", and used to produce a person called Kinetic Data."""
+        from wealthscan.extract import reconcile
+        false_people = [
+            (headline, [p.name for p in reconcile(headline)[0]])
+            for headline in self.NOBODY if reconcile(headline)[0]
+        ]
+        self.assertEqual(false_people, [])
+
+    def test_family_businesses_name_everyone(self):
+        from wealthscan.extract import extract_people
+        for text, expected in [
+            ("Castore founders Tom and Phil Beahon plan US expansion",
+             {"Tom Beahon", "Phil Beahon"}),
+            ("Brothers James and Robert Tresize sell Cornish dairy for £22m",
+             {"James Tresize", "Robert Tresize"}),
+            ("Husband and wife team Anna and Mark Pellow sell Devon holiday park",
+             {"Anna Pellow", "Mark Pellow"}),
+        ]:
+            self.assertEqual({p.name for p in extract_people(text)}, expected, text)
+
+    def test_possessive_owners_are_people(self):
+        from wealthscan.extract import reconcile
+        people, company = reconcile("Dale Vince's Ecotricity reports record year")
+        self.assertEqual([p.name for p in people], ["Dale Vince"])
+        self.assertEqual(company, "Ecotricity")
+        people, _ = reconcile("Entrepreneur Sarah Tresize's logistics firm acquired by DHL")
+        self.assertEqual([p.name for p in people], ["Sarah Tresize"], "no trailing 's")
+
+    def test_press_descriptors_are_roles_not_names(self):
+        from wealthscan.extract import extract_people
+        people = extract_people("Hotelier Anna Pellow sells Cornish hotel group for £30m")
+        self.assertEqual([(p.name, p.title) for p in people], [("Anna Pellow", "Hotelier")])
+
+    def test_a_surname_that_is_a_landscape_word_survives(self):
+        from wealthscan.extract import extract_people
+        self.assertEqual(
+            [p.name for p in extract_people("Founder Jordan Green sells Devon firm")],
+            ["Jordan Green"],
+        )
+
+
+class TestGoogleNewsFeed(unittest.TestCase):
+    """Google News RSS does not mean what the RSS spec says. These pin the three
+    ways that broke live results: HTML in the summary, the outlet's name in the
+    title, and clustered coverage thrown away."""
+
+    def setUp(self):
+        from wealthscan.sources import parse_feed
+        self.articles = parse_feed(
+            (FIXTURES / "google_news.xml").read_text(), default_publisher="Google News"
+        )
+
+    def test_no_markup_reaches_the_extractor(self):
+        from wealthscan.sources import expand_related
+        for article in expand_related(self.articles):
+            for field_text in (article.title, article.summary):
+                self.assertNotIn("<", field_text)
+                self.assertNotIn("href", field_text)
+                self.assertNotIn("news.google.com", field_text)
+
+    def test_the_outlet_is_not_part_of_the_headline(self):
+        titles = [a.title for a in self.articles]
+        self.assertIn("Exeter engineering firm acquired by German rival in £64m deal", titles)
+        self.assertFalse(any(t.endswith("Business Live") for t in titles))
+        self.assertEqual(self.articles[0].publisher, "Business Live")
+
+    def test_an_outlet_name_is_not_a_location(self):
+        """"Manchester logistics group sold – Bristol Live" is a Manchester story.
+        Reach's regional titles are named after the places they cover, so with
+        the suffix left in, most South West coverage located itself by masthead."""
+        from wealthscan.markets import resolve_market
+        manchester = next(a for a in self.articles if "Manchester" in a.title)
+        match = resolve_market(f"{manchester.title}. {manchester.summary}")
+        self.assertIsNotNone(match)
+        self.assertNotEqual(match.market_name, "Bristol")
+
+    def test_clustered_coverage_is_recovered(self):
+        halberton = next(a for a in self.articles if "Halberton" in a.title)
+        self.assertEqual(len(halberton.related), 2)
+        self.assertEqual(
+            {r.publisher for r in halberton.related}, {"Insider Media", "Express & Echo"}
+        )
+
+    def test_the_whole_pipeline_on_a_real_format_feed(self):
+        from wealthscan.markets import CORE_MARKET_KEYS
+        with TempBook() as db:
+            result = _run_fixture(
+                "google_news.xml", market_key="uk-devon", event_key="acquisition",
+                markets=CORE_MARKET_KEYS,
+            )
+            with db.connect() as conn:
+                people = {r["full_name"]: r for r in db.all_prospects(conn)}
+                self.assertIn("Gareth Halberton", people)
+                gareth = people["Gareth Halberton"]
+                # The headline says "sells Halberton Precision" with no "Ltd". The
+                # company must still be found, or the record can never be
+                # verified and stays hidden from the default view.
+                self.assertEqual(gareth["company"], "Halberton Precision")
+                self.assertEqual(gareth["verification_state"], "Corroborated")
+                # The siblings name nobody: they are extra sources on Gareth, not
+                # anonymous leads cluttering the worklist.
+                sources = db.prospect_sources(conn, int(gareth["id"]))
+                self.assertEqual(len(sources), 3, "primary plus two clustered outlets")
+                self.assertGreaterEqual(result.updated_prospects, 2)
+                # The Manchester story is out of scope and must not appear.
+                self.assertFalse(any("Manchester" in (r["rationale"] or "")
+                                     for r in people.values()))
+            self.assertGreaterEqual(result.rejected, 1)
+
+
 class TestLegitimacy(unittest.TestCase):
     """An article about a business sale names four kinds of person and only one
     of them is a prospect. Telling them apart is the difference between a book

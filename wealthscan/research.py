@@ -41,6 +41,7 @@ from .scoring import (
 )
 from .sources import (
     Fetcher,
+    expand_related,
     fetch_feed,
     find_company_principals,
     verify_with_companies_house,
@@ -156,78 +157,37 @@ def run_research(
                 result.warnings.append(warning)
             continue
 
-        result.articles_seen += len(articles)
+        result.articles_seen += sum(1 + len(a.related) for a in articles)
 
         for article in articles:
-            with db.connect() as conn:
-                # Skip anything already processed in an earlier run.
-                if not db.mark_seen(conn, article.url):
-                    continue
-
-            event = extract_event(
-                title=article.title,
-                summary=article.summary,
-                url=article.url,
-                publisher=article.publisher or publisher,
-                published_at=article.published_at,
-                query_event_key=event_key,
-                query_market_key=market_key,
-                allowed_markets=markets,
-            )
-            if event is None:
-                result.rejected += 1
-                continue
-
-            # Screen before a record can exist. A prospect that is created and
-            # then hidden still turns up in exports, totals and screenshots.
-            refusal = screen(
-                text=f"{event.title} {event.summary}",
-                person_name=event.people[0].name if event.people else None,
-                job_title=event.people[0].title if event.people else None,
-                url=event.url,
-            )
-            if refusal is not None:
-                result.excluded += 1
-                with db.connect() as conn:
-                    db.record_exclusion(conn, {
-                        "rule": refusal.rule,
-                        "reason": refusal.reason,
-                        "person_name": event.people[0].name if event.people else None,
-                        "company": event.company,
-                        "title": event.title,
-                        "url": event.url,
-                        "publisher": event.publisher,
-                    })
-                continue
-
-            result.events_kept += 1
-            outcome = _store_event(
-                event,
-                fetcher=fetcher,
+            # Google clusters the same story from several outlets into one item.
+            # The primary goes first; its siblings then either name somebody
+            # themselves or, if they name nobody, count as further sources on
+            # whoever the primary named — which is what corroboration is.
+            outcome = process_article(
+                article, result=result, fetcher=fetcher,
+                publisher=publisher, event_key=event_key, market_key=market_key,
+                markets=markets,
                 verify_ch=verify_companies_house and ch_disabled_reason is None,
             )
-
-            if outcome.get("ch_warning"):
-                warning_text = str(outcome["ch_warning"])
-                # A key problem is systemic; report it once and stop retrying.
-                if "rejected the key" in warning_text or "unreachable" in warning_text:
-                    ch_disabled_reason = warning_text
-                    result.warnings.append(
-                        f"Companies House verification disabled: {warning_text}"
-                    )
-
-            if outcome["kind"] == "new":
-                # One article can name two co-founders. Both are prospects.
-                result.new_prospects += 1 + int(outcome.get("extra_new", 0) or 0)
-                result.updated_prospects += int(outcome.get("extra_updated", 0) or 0)
-                result.log.append(
-                    f"New · {outcome['name']} · {event.market_name} · {event.event_label}"
-                    + (f" · {event.publisher}" if event.publisher else "")
+            cluster_ids = list(outcome.get("prospect_ids", []) if outcome else [])
+            for sibling in article.related:
+                process_article(
+                    sibling, result=result, fetcher=fetcher,
+                    publisher=publisher, event_key=event_key, market_key=market_key,
+                    markets=markets,
+                    verify_ch=verify_companies_house and ch_disabled_reason is None,
+                    cluster_ids=cluster_ids,
                 )
-            elif outcome["kind"] == "updated":
-                result.updated_prospects += 1 + int(outcome.get("extra_updated", 0) or 0)
-            elif outcome["kind"] == "company_lead":
-                result.company_leads += 1
+
+            warning_text = str((outcome or {}).get("ch_warning") or "")
+            # A key problem is systemic; report it once and stop retrying.
+            if warning_text and ("rejected the key" in warning_text
+                                 or "unreachable" in warning_text):
+                ch_disabled_reason = warning_text
+                result.warnings.append(
+                    f"Companies House verification disabled: {warning_text}"
+                )
 
     if result.stopped_early:
         result.status = "partial"
@@ -249,6 +209,154 @@ def run_research(
             log=result.log,
         )
     return result
+
+
+def process_article(
+    article,
+    *,
+    result: RunResult,
+    fetcher: Fetcher,
+    publisher: str,
+    event_key: str | None,
+    market_key: str | None,
+    markets: tuple[str, ...] | list[str],
+    verify_ch: bool,
+    cluster_ids: list[int] | None = None,
+) -> dict | None:
+    """Everything that happens to one article, in order.
+
+    Kept as one function so the sweep, the importer and the offline tests all
+    run exactly the same path — a pipeline that is only exercised live is a
+    pipeline nobody has tested.
+    """
+    with db.connect() as conn:
+        # Skip anything already processed in an earlier run.
+        if not db.mark_seen(conn, article.url):
+            return None
+
+    event = extract_event(
+        title=article.title,
+        summary=article.summary,
+        url=article.url,
+        publisher=article.publisher or publisher,
+        published_at=article.published_at,
+        query_event_key=event_key,
+        query_market_key=market_key,
+        allowed_markets=markets,
+    )
+    if event is None:
+        result.rejected += 1
+        return None
+
+    # Screen before a record can exist. A prospect that is created and then
+    # hidden still turns up in exports, totals and screenshots.
+    refusal = screen(
+        text=f"{event.title} {event.summary}",
+        person_name=event.people[0].name if event.people else None,
+        job_title=event.people[0].title if event.people else None,
+        url=event.url,
+    )
+    if refusal is not None:
+        result.excluded += 1
+        with db.connect() as conn:
+            db.record_exclusion(conn, {
+                "rule": refusal.rule,
+                "reason": refusal.reason,
+                "person_name": event.people[0].name if event.people else None,
+                "company": event.company,
+                "title": event.title,
+                "url": event.url,
+                "publisher": event.publisher,
+            })
+        return None
+
+    # A cluster sibling that names nobody is not an unnamed deal — it is the
+    # same deal, reported by another outlet. Attach it to whoever the primary
+    # named rather than queueing it as an anonymous lead.
+    if not event.people and cluster_ids:
+        with db.connect() as conn:
+            for prospect_id in cluster_ids:
+                if db.add_source(conn, prospect_id, _source_row(event)):
+                    db.add_event(conn, prospect_id, "corroborated",
+                                 f"Same story reported by {event.publisher or 'another outlet'}.",
+                                 event.url)
+                    _refresh_corroboration(conn, prospect_id)
+        result.updated_prospects += len(cluster_ids)
+        result.events_kept += 1
+        return {"kind": "corroborated", "prospect_ids": cluster_ids}
+
+    result.events_kept += 1
+    outcome = _store_event(event, fetcher=fetcher, verify_ch=verify_ch)
+
+    if outcome["kind"] == "new":
+        # One article can name two co-founders. Both are prospects.
+        result.new_prospects += 1 + int(outcome.get("extra_new", 0) or 0)
+        result.updated_prospects += int(outcome.get("extra_updated", 0) or 0)
+        result.log.append(
+            f"New · {outcome['name']} · {event.market_name} · {event.event_label}"
+            + (f" · {event.publisher}" if event.publisher else "")
+        )
+    elif outcome["kind"] == "updated":
+        result.updated_prospects += 1 + int(outcome.get("extra_updated", 0) or 0)
+    elif outcome["kind"] == "company_lead":
+        result.company_leads += 1
+    return outcome
+
+
+def _source_row(event: ExtractedEvent) -> dict:
+    return {
+        "url": event.url,
+        "title": event.title,
+        "publisher": event.publisher,
+        "published_at": event.published_at.isoformat() if event.published_at else None,
+        "event_key": event.event_key,
+        "event_label": event.event_label,
+        "amount_gbp": event.amount_gbp,
+        "excerpt": event.summary[:400],
+        "rationale": event.rationale,
+    }
+
+
+def _refresh_corroboration(conn, prospect_id: int) -> None:
+    """Re-grade a record after it gains a source.
+
+    Without this a second outlet's report is stored but changes nothing: the
+    record stays "single source" and Unconfirmed, and corroboration is a word
+    in a docstring rather than a thing the app does.
+    """
+    row = db.prospect(conn, prospect_id)
+    if row is None or row["suppressed_at"]:
+        return
+    sources = [dict(s) for s in db.prospect_sources(conn, prospect_id)]
+    publishers = {(s.get("publisher") or "").strip().lower() for s in sources} - {""}
+    trusted = any(
+        marker in pub for pub in publishers for marker in TRUSTED_PUBLISHERS
+    )
+    standing = assess(
+        name=row["full_name"],
+        job_title=row["job_title"],
+        company=row["company"],
+        publisher=next(iter(publishers), None),
+        source_count=max(len(publishers), 1),
+        register_matched=bool(row["ch_officer_name"]),
+        ownership_filed=bool(row["ch_ownership_band"]),
+        text=" ".join(s.get("title") or "" for s in sources),
+        trusted_publisher=trusted,
+    )
+    grade, basis = grade_record(sources)
+    conn.execute(
+        """UPDATE prospects SET verification_state = ?, legitimacy_score = ?,
+               legitimacy_checks = ?, legitimacy_next_step = ?,
+               evidence_grade = CASE WHEN ? = 'High' THEN 'High' ELSE evidence_grade END,
+               last_updated = ?
+           WHERE id = ?""",
+        (
+            standing.state, standing.score,
+            json.dumps([{"label": c.label, "passed": c.passed, "why": c.detail}
+                        for c in standing.checks]),
+            standing.next_step, grade, db.now_iso(), prospect_id,
+        ),
+    )
 
 
 #: Which of the brief's four wealth sources an event evidences. Land and estate
@@ -372,6 +480,7 @@ def _store_event(
         "name": ", ".join(str(o["name"]) for o in (created or outcomes)),
         "extra_new": max(0, len(created) - 1),
         "extra_updated": len(outcomes) - len(created) - (0 if created else 1),
+        "prospect_ids": [int(o["prospect_id"]) for o in outcomes],
         "ch_warning": next((o["ch_warning"] for o in outcomes if o["ch_warning"]), None),
     }
 
@@ -550,6 +659,9 @@ def _store_person(
             db.add_event(conn, prospect_id, "corroborated",
                          f"Additional source: {event.event_label} via {event.publisher}.",
                          event.url)
+            # A second outlet naming the same person is the corroboration the
+            # verification tiers ask for; re-grade so it actually counts.
+            _refresh_corroboration(conn, prospect_id)
 
         if stake_verified and ch_match:
             db.add_event(conn, prospect_id, "verified",
@@ -566,6 +678,7 @@ def _store_person(
     return {
         "kind": "new" if created else "updated",
         "name": person.name,
+        "prospect_id": prospect_id,
         "ch_warning": ch_warning,
     }
 

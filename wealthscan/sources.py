@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse, parse_qs
@@ -43,6 +43,10 @@ class Article:
     summary: str
     publisher: str
     published_at: datetime | None
+    #: Other outlets' headlines for the same story, which Google News bundles
+    #: into one item. Each is an independent source — free corroboration that
+    #: used to be discarded along with the HTML it arrived in.
+    related: list["Article"] = field(default_factory=list)
 
 
 class Fetcher:
@@ -107,12 +111,58 @@ def _decode(text: str) -> str:
     return text
 
 
+def _clean(raw: str) -> str:
+    """Markup → plain text, for fields that arrive entity-escaped.
+
+    Google News descriptions are HTML *inside* an escaped string:
+    ``&lt;a href="…"&gt;Headline&lt;/a&gt;``. Stripping tags before decoding —
+    the original order — leaves the anchor in place and hands the extractor a
+    Google redirect URL as though it were article text. So: decode, strip, and
+    decode again for the double-escaped ampersands ("Express &amp;amp; Echo").
+    """
+    text = _CDATA.sub(r"\1", raw)
+    text = _decode(text)
+    text = _TAGS.sub(" ", text)
+    text = _decode(text)
+    return " ".join(text.split())
+
+
 def _tag(block: str, name: str) -> str:
     match = re.search(rf"<{name}[^>]*>([\s\S]*?)</{name}>", block, re.IGNORECASE)
     if not match:
         return ""
-    inner = _CDATA.sub(r"\1", match.group(1))
-    return _decode(_TAGS.sub(" ", inner)).strip()
+    return _clean(match.group(1))
+
+
+def _raw_tag(block: str, name: str) -> str:
+    match = re.search(rf"<{name}[^>]*>([\s\S]*?)</{name}>", block, re.IGNORECASE)
+    if not match:
+        return ""
+    return _decode(_CDATA.sub(r"\1", match.group(1)))
+
+
+def _strip_publisher_suffix(title: str, publisher: str, *, google: bool) -> str:
+    """Remove the " - Publisher" Google appends to every headline.
+
+    Left in place it is not cosmetic: "Manchester logistics group sold - Bristol
+    Live" resolves to Bristol, because the outlet's name is the only place name
+    the resolver can find. Reach's regional titles are called Devon Live,
+    Somerset Live, Cornwall Live, and they carry most South West business news —
+    so this was misfiling a large share of real results.
+    """
+    if publisher and title.endswith(f" - {publisher}"):
+        return title[: -len(f" - {publisher}")].rstrip()
+    if google and " - " in title:
+        # Google always appends the source last; if the <source> element was
+        # missing or spelled differently, the final segment is still the outlet.
+        return title.rsplit(" - ", 1)[0].rstrip()
+    return title
+
+
+_RELATED_ITEM = re.compile(
+    r"<li>\s*<a[^>]*href=\"([^\"]+)\"[^>]*>([\s\S]*?)</a>([\s\S]*?)</li>", re.IGNORECASE
+)
+_FONT = re.compile(r"<font[^>]*>([\s\S]*?)</font>", re.IGNORECASE)
 
 
 def _parse_date(text: str) -> datetime | None:
@@ -143,34 +193,77 @@ def _unwrap_google_url(url: str) -> str:
 
 
 def parse_feed(xml: str, *, default_publisher: str = "") -> list[Article]:
-    """Read RSS or Atom into articles. Deliberately dependency-free."""
+    """Read RSS or Atom into articles. Deliberately dependency-free.
+
+    Google News items get special handling, because their fields do not mean
+    what the RSS spec says: the title carries the publisher, the description is
+    an HTML fragment repeating the title, and clustered stories hide the other
+    outlets' headlines in an ``<ol>`` inside that fragment.
+    """
     articles: list[Article] = []
     for match in _ITEM.finditer(xml):
         block = match.group(0)
 
-        title = _tag(block, "title")
+        raw_title = _tag(block, "title")
         link = _tag(block, "link")
         if not link:
             href = re.search(r"<link[^>]*href=[\"']([^\"']+)[\"']", block, re.IGNORECASE)
             link = href.group(1) if href else ""
-        if not title or not link:
+        if not raw_title or not link:
             continue
 
-        summary = _tag(block, "description") or _tag(block, "summary") or _tag(block, "content")
-        # Google News puts the publisher in a <source> element.
-        publisher = _tag(block, "source") or default_publisher
+        publisher = (_tag(block, "source") or default_publisher).strip()
         published = _parse_date(
             _tag(block, "pubDate") or _tag(block, "published") or _tag(block, "updated")
         )
+        google = "news.google.com" in link
+        title = _strip_publisher_suffix(raw_title, publisher, google=google)
+
+        related: list[Article] = []
+        if google:
+            description_html = _raw_tag(block, "description")
+            for rel_url, rel_title_html, tail in _RELATED_ITEM.findall(description_html):
+                rel_title = _clean(rel_title_html)
+                font = _FONT.search(tail)
+                rel_publisher = _clean(font.group(1)) if font else ""
+                if not rel_title or rel_title == title:
+                    continue
+                related.append(Article(
+                    title=_strip_publisher_suffix(rel_title, rel_publisher, google=True),
+                    url=_unwrap_google_url(rel_url.strip()),
+                    summary="",
+                    publisher=rel_publisher or publisher,
+                    published_at=published,
+                ))
+            # The description only ever repeats headlines, so it contributes
+            # nothing as a summary — and concatenating the cluster into it would
+            # attribute one outlet's names to another outlet's story.
+            summary = ""
+        else:
+            summary = (
+                _tag(block, "description") or _tag(block, "summary") or _tag(block, "content")
+            )
+            if summary == title:
+                summary = ""
 
         articles.append(Article(
             title=title,
             url=_unwrap_google_url(link.strip()),
             summary=summary,
-            publisher=publisher.strip() or default_publisher,
+            publisher=publisher or default_publisher,
             published_at=published,
+            related=related,
         ))
     return articles
+
+
+def expand_related(articles: list[Article]) -> list[Article]:
+    """Primary articles followed by their clustered siblings, flattened."""
+    flat: list[Article] = []
+    for article in articles:
+        flat.append(article)
+        flat.extend(article.related)
+    return flat
 
 
 def fetch_feed(fetcher: Fetcher, url: str, *, publisher: str = "") -> tuple[list[Article], str | None]:

@@ -148,6 +148,12 @@ _TITLE_WORDS = (
     # forms miss it entirely because of the trailing "s".
     "founders", "co-founders", "cofounders", "owners", "co-owners", "directors",
     "shareholders", "brothers", "sisters", "siblings", "partners",
+    # Descriptors regional press puts in front of a name. Unrecognised, they
+    # become part of it: "Hotelier Anna Pellow" was a three-word person.
+    "businessman", "businesswoman", "hotelier", "restaurateur", "property developer",
+    "developer", "housebuilder", "philanthropist", "financier", "industrialist",
+    "publican", "brewer", "retailer", "animator", "engineer", "inventor",
+    "designer", "architect", "dealmaker", "serial entrepreneur", "tech entrepreneur",
 )
 _TITLE_ACRONYMS = ("CEO", "CFO", "MD", "COO", "CTO", "CSO", "CIO", "CCO")
 
@@ -232,6 +238,38 @@ _PAIR_PATTERN = re.compile(
     rf"\b(?:{_HONORIFIC})?({_NAME})\s+and\s+(?:{_HONORIFIC})?({_NAME})"
     rf"\s+(?:{_SUBJECTS})\b"
 )
+#: "Castore founders Tom and Phil Beahon", "husband and wife Anna and Mark
+#: Tresize" — two first names sharing one surname. This is how family businesses
+#: are written up, and family businesses are the target. A relationship or
+#: plural-role word must come first: without it, "Marks and Spencer" is a couple.
+_FAMILY_LEAD = "|".join(_ci(w) for w in (
+    "brothers", "sisters", "siblings", "twins", "cousins", "couple",
+    "husband and wife", "husband-and-wife", "father and son", "father and daughter",
+    "mother and son", "mother and daughter", "founders", "co-founders", "owners",
+    "co-owners", "directors", "partners", "shareholders", "husband and wife team",
+    "family",
+))
+_FIRST = rf"[{_UPPER}][{_LETTER}]+"
+_FAMILY_PATTERN = re.compile(
+    rf"\b(?:{_FAMILY_LEAD})\s+(?:team\s+)?({_FIRST})\s+(?:and|&)\s+({_FIRST})\s+"
+    rf"({_WORD}(?:\s+(?:{_PARTICLE}\s+)?{_WORD})?)"
+)
+
+#: "Dale Vince's Ecotricity", "John Pellow's Cornish holiday park sold" — the
+#: owner named possessively. Only when what follows is a business: "Sarah's
+#: birthday" is not a wealth event, and requiring two name words already rules
+#: out "Plymouth's".
+_BUSINESS_NOUNS = (
+    "firm", "company", "business", "group", "empire", "estate", "farm", "park",
+    "brand", "chain", "stake", "shareholding", "holding", "family business",
+    "portfolio", "hotel", "hotels", "brewery", "dairy", "factory", "manufacturer",
+    "agency", "consultancy", "fund", "venture", "startup", "start-up",
+)
+_POSSESSIVE_PATTERN = re.compile(
+    rf"(?:\b{_HONORIFIC})?\b({_NAME})['’]s\s+"
+    rf"(?:[A-Z]|(?:[a-z-]+\s+){{0,3}}(?:{'|'.join(_ci(n) for n in _BUSINESS_NOUNS)})\b)"
+)
+
 #: "…founded by Alice Marchmont and Ruth Pelling" — same problem, other side.
 _PAIR_AGENT_PATTERN = re.compile(
     rf"\b(?:{_AGENTS})\s+(?:{_HONORIFIC})?({_NAME})\s+and\s+(?:{_HONORIFIC})?({_NAME})\b"
@@ -264,6 +302,30 @@ _GENERIC = frozenset({
     "Deal", "Sale", "Stake", "Shares", "Round", "Fundraise", "Buyout",
     "Exchange", "Market", "Markets", "Report", "News", "Times", "Post",
     "Journal", "Herald", "Gazette", "Magazine", "Review",
+    # Words that only ever appear in business names. "Kinetic Data sold to US
+    # buyer" has exactly the shape of "Gareth Halberton sold…", and without
+    # these the company was being recorded as a person.
+    "Data", "Tech", "Technology", "Technologies", "Software", "Systems", "Labs",
+    "Digital", "Energy", "Homes", "Foods", "Food", "Dairies", "Dairy", "Brewery",
+    "Brewing", "Aero", "Aerospace", "Holidays", "Precision", "Engineering",
+    "Logistics", "Medical", "Health", "Healthcare", "Bio", "Biotech", "Media",
+    "Solutions", "Services", "Consulting", "Estates", "Properties", "Property",
+    "Motors", "Marine", "Industries", "Products", "Brands", "Provisions",
+    "Tooling", "Boatworks", "Renewables", "Semiconductor", "Pharma", "Capital",
+    "Ventures", "Partners", "Hotels", "Leisure", "Construction", "Developments",
+    "Interiors", "Furniture", "Packaging", "Plastics", "Chemicals", "Textiles",
+    "Insurance", "Finance", "Payments", "Robotics", "Analytics", "Networks",
+    "Studios", "Agency", "Farms", "Nurseries", "Distillery", "Cider", "Gin",
+    # Landscape and institutions — "Salisbury Plain Farmland sells for £12m" and
+    # "Dartmoor National Park buys farm" have a person's shape and no person.
+    # Only words that are never surnames: Park, Hill, Wood and Green are, and are
+    # handled by length instead.
+    "Farmland", "National", "Plain", "Moor", "Moors", "Valley", "Forest",
+    "Council", "Councils", "Railway", "Railways", "Airport", "Hospital",
+    "University", "College", "School", "Academy", "Awards", "Estate", "Estates",
+    "Harbour", "Parish", "County", "Borough", "District", "Authority",
+    "Authorities", "Commission", "Society", "Association", "Federation",
+    "Institute", "Chamber", "Rovers", "United", "Athletic", "Wanderers",
 })
 
 #: Corporate suffixes: if a candidate ends in one it is a company, not a person.
@@ -346,6 +408,11 @@ def _plausible_name(candidate: str) -> bool:
     # A name whose first two words are both places ("Palm Beach") is a location.
     if len(words) >= 2 and " ".join(words[:2]).lower() in _PLACE_NAMES:
         return False
+    # A surname that is also a landscape word is fine in a two-word name ("Nick
+    # Park") and never the last word of a three-word one ("Dartmoor National Park").
+    if len(words) >= 3 and words[-1] in {"Park", "Parks", "Hill", "Hills", "Wood",
+                                          "Woods", "Green", "Field", "Fields", "Bay"}:
+        return False
     # Require at least one word of three or more letters — filters initials soup.
     if not any(len(w) >= 3 for w in words):
         return False
@@ -362,6 +429,7 @@ def extract_people(text: str) -> list[Person]:
     found: list[Person] = []
 
     def add(name: str, title: str) -> None:
+        name = re.sub(r"['’]s$", "", name.strip(" ,.;:"))
         words = " ".join(name.split()).strip(" ,.;:").split()
         # Drop any job title the pattern picked up in front of the name.
         while words and words[0] in _TITLE_LEAD:
@@ -377,7 +445,17 @@ def extract_people(text: str) -> list[Person]:
         for match in pattern.finditer(text):
             add(match.group(name_group), _normalise_title(match.group(title_group)))
 
-    # Pairs first: both halves are wanted, and the singular patterns below would
+    for match in _POSSESSIVE_PATTERN.finditer(text):
+        add(match.group(1), "")
+
+    # Families first: "Tom and Phil Beahon" is two people with one surname, and
+    # every other pattern either misses them or keeps only "Phil Beahon".
+    for match in _FAMILY_PATTERN.finditer(text):
+        surname = match.group(3)
+        add(f"{match.group(1)} {surname}", "")
+        add(f"{match.group(2)} {surname}", "")
+
+    # Pairs next: both halves are wanted, and the singular patterns below would
     # only ever reach whichever name sits next to the verb.
     for pattern in (_PAIR_PATTERN, _PAIR_AGENT_PATTERN):
         for match in pattern.finditer(text):
@@ -396,12 +474,147 @@ def extract_people(text: str) -> list[Person]:
 # ---------------------------------------------------------------------------
 # Companies
 # ---------------------------------------------------------------------------
+#
+# A headline names two companies about as often as one, and they are not
+# interchangeable: "Meridian Capital acquires Solent Semiconductor" is a story
+# about the *seller's* business, and the seller is the prospect. So companies
+# are read from **target positions** — the thing sold, bought, backed or founded
+# — and never from buyer positions ("acquired by X", "sold to X", "X buys").
+#
+# Headlines almost never include "Ltd". Requiring a corporate suffix, as the
+# first version did, meant most real records had no company, which the
+# verification tiers then (correctly) refuse to promote. That combination hid
+# nearly every genuine prospect a live sweep found.
 
 _COMPANY = re.compile(
     r"\b((?:[A-Z][\w&'’.-]*\s+){0,4}"
     r"(?:Ltd|Limited|PLC|plc|LLP|LLC|Inc|Corp|Group|Holdings|Partners|Capital|"
     r"Ventures|Technologies|Systems|Solutions|GmbH|AG|PJSC|Bhd|Pty))\b"
 )
+
+#: A run of capitalised tokens — a proper name. "&" joins ("Smith & Sons").
+_CAP = r"[A-Z][\w&'’.-]*"
+_CAP_PHRASE = rf"(?:{_CAP})(?:\s+(?:{_CAP}|&))*"
+
+#: What a business is called in a headline before its name is given.
+_SECTOR_NOUNS = (
+    "firm", "company", "business", "group", "maker", "manufacturer", "producer",
+    "brewer", "brewery", "distiller", "distillery", "developer", "specialist",
+    "supplier", "provider", "retailer", "operator", "brand", "agency", "consultancy",
+    "startup", "start-up", "scale-up", "scaleup", "fintech", "biotech", "medtech",
+    "dairy", "bakery", "housebuilder", "contractor", "chain", "manufacturers",
+    "family business", "family firm", "engineer", "engineers", "designer",
+    "producer", "processor", "wholesaler", "distributor", "haulier", "insurer",
+    "lender", "platform", "studio", "practice", "cider maker", "gin maker",
+)
+_SECTOR = "|".join(_ci(n) for n in sorted(_SECTOR_NOUNS, key=len, reverse=True))
+
+#: "Bath-based", "Truro-headquartered" — journalese before a company name.
+_BASED = r"(?:[A-Z][\w'’.]*-(?:based|headquartered|listed|owned|founded)\s+)"
+#: "Plymouth's", "Gloucestershire's" — a place possessive before a name. Only
+#: *known* places qualify: "Arkell's Brewery" has the same shape, and treating
+#: Arkell's as a town leaves a company called "Brewery".
+_KNOWN_PLACE = "(?:" + "|".join(
+    re.escape(place) for place in sorted(
+        {p for m in MARKET_BY_KEY.values() for p in m.places}, key=len, reverse=True
+    )
+) + ")"
+_PLACE_POSSESSIVE = rf"(?:{_KNOWN_PLACE}['’]s\s+)"
+
+_TARGET_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # "software firm Kinetic Data", "cider maker Thatchers"
+    re.compile(rf"\b(?:{_SECTOR})\s+{_BASED}?({_CAP_PHRASE})"),
+    # "Owner of Plymouth's Mount Batten Boatworks", "founder of Rengen"
+    re.compile(
+        rf"\b(?:{_ci('founder')}|{_ci('co-founder')}|{_ci('owner')}|{_ci('owners')}|"
+        rf"{_ci('chairman')}|{_ci('boss')}|{_ci('chief executive')}|"
+        rf"{_ci('managing director')}|{_ci('shareholders')})\s+{_ci('of')}\s+"
+        rf"{_BASED}?{_PLACE_POSSESSIVE}?({_CAP_PHRASE})"
+    ),
+    # "Acquisition of Cotswold Provisions", "stake in Solent Semiconductor"
+    re.compile(
+        rf"\b(?:{_ci('acquisition')}|{_ci('takeover')}|{_ci('sale')}|{_ci('purchase')}|"
+        rf"{_ci('buyout')}|{_ci('buy-out')})\s+(?:{_ci('of')}|{_ci('at')})\s+"
+        rf"(?:{_ci('the')}\s+)?{_BASED}?{_PLACE_POSSESSIVE}?({_CAP_PHRASE})"
+    ),
+    re.compile(
+        rf"\b{_ci('stake')}\s+{_ci('in')}\s+(?:[a-z]+\s+){{0,3}}{_BASED}?({_CAP_PHRASE})"
+    ),
+    # "Thales acquires Bath-based Coda Octopus" — the object is the target.
+    re.compile(
+        rf"\b(?:{_ci('buys')}|{_ci('acquires')}|{_ci('snaps up')}|{_ci('takes over')}|"
+        rf"{_ci('backs')}|{_ci('sells')}|{_ci('sold')}|{_ci('has sold')})\s+"
+        rf"(?:{_ci('the')}\s+)?{_BASED}({_CAP_PHRASE})"
+    ),
+    # "Gareth Halberton sells Halberton Precision" — a person selling a company.
+    re.compile(rf"\b(?:{_ci('sells')}|{_ci('has sold')})\s+({_CAP_PHRASE})"),
+    # "Halberton Precision bought by…", "Quantock Energy Ltd sold to…"
+    re.compile(
+        rf"(?:^|[.:;]\s+){_BASED}?{_PLACE_POSSESSIVE}?({_CAP_PHRASE})\s+"
+        rf"(?:{_ci('has been')}\s+|{_ci('is')}\s+|{_ci('was')}\s+)?"
+        rf"(?:{_ci('bought')}|{_ci('acquired')}|{_ci('sold')}|{_ci('snapped up')}|"
+        rf"{_ci('taken over')}|{_ci('agrees sale')}|{_ci('changes hands')})\b"
+    ),
+    # "Castore founders Tom and Phil…", "Rengen founder Iestyn Lewis"
+    re.compile(
+        rf"(?:^|[.:;]\s+|\b(?:at|of)\s+)?({_CAP_PHRASE})\s+(?:{_ci('founders')}|"
+        rf"{_ci('founder')}|{_ci('co-founder')}|{_ci('owner')}|{_ci('owners')}|"
+        rf"{_ci('boss')}|{_ci('chairman')}|{_ci('chief')})\s+[A-Z]"
+    ),
+    # "Dale Vince's Ecotricity", "Gloucestershire's Kemble Aero"
+    re.compile(rf"[A-Z][\w.-]*(?:\s+[A-Z][\w.-]*)?['’]s\s+({_CAP_PHRASE})"),
+)
+
+#: Tokens that end a company name when a Title Case headline runs everything
+#: together ("Firm Kinetic Data Sold To US Buyer").
+_COMPANY_STOP = frozenset({
+    "sold", "to", "by", "for", "in", "acquired", "buys", "buy", "deal", "as", "after",
+    "with", "from", "sells", "bought", "agrees", "agreed", "plans", "backed",
+    "reports", "announces", "completes", "raises", "secures", "at", "on", "and",
+    "founder", "founders", "owner", "owners", "boss", "chairman", "chief", "ceo",
+    "co-founder", "has", "is", "was", "the", "a", "an", "of", "takes", "exits",
+    "snapped", "taken", "changes", "backs", "expands", "enters", "lands", "wins",
+})
+
+#: A candidate made only of these is a description, not a name.
+_COMPANY_GENERIC = frozenset({
+    "private", "equity", "firm", "company", "business", "group", "holdings",
+    "family", "us", "uk", "german", "french", "american", "british", "european",
+    "rival", "buyer", "investor", "investors", "management", "team", "board",
+    "founder", "owner", "shareholders", "gulf", "chinese", "japanese", "indian",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "brewery", "dairy", "bakery", "distillery", "agency", "studio", "practice",
+    "cornish", "devonian", "welsh", "scottish", "english", "irish", "bristolian",
+    "londoner", "dorset", "somerset", "wiltshire", "cotswold", "west", "south",
+    "north", "east", "southern", "northern", "western", "eastern", "regional",
+    "local", "national", "international", "global", "leading", "independent",
+})
+
+
+def _trim_company(candidate: str) -> str | None:
+    """Cut a captured phrase down to the name and reject non-names."""
+    words = candidate.replace("’", "'").split()
+    kept: list[str] = []
+    for word in words:
+        if word.lower().strip(".,;:") in _COMPANY_STOP:
+            break
+        kept.append(word.strip(".,;:"))
+    while kept and (
+        _COMPANY_PREFIX.match(kept[0]) or kept[0].lower() in {"the", "a", "an"}
+    ):
+        kept.pop(0)
+    while kept and kept[-1] in {"&", "and"}:
+        kept.pop()
+    if not kept or len(kept) > 5:
+        return None
+    lowered = [k.lower() for k in kept]
+    if all(k in _COMPANY_GENERIC or k in _PLACE_NAMES for k in lowered):
+        return None
+    name = " ".join(kept)
+    if name.lower() in _PLACE_NAMES or name.lower() in _NOT_PEOPLE:
+        return None
+    return name
+
 
 #: Journalese that sits in front of a company name: "Connecticut-based Ellsworth
 #: Ridge Capital", "the Türkiye-listed retailer". Capitalised, so the pattern
@@ -410,18 +623,70 @@ _COMPANY_PREFIX = re.compile(
     r"^[A-Z][\w'’.]*-(?:based|listed|headquartered|owned|backed|founded)$"
 )
 
+#: A company in one of these positions is the buyer or its backer.
+_BUYER_CONTEXT = re.compile(
+    r"(?:\b(?:by|to|from|with)\s+$)", re.I
+)
+_BUYER_FOLLOWS = re.compile(
+    r"^\s+(?:acquires|buys|backs|invests|takes|has acquired|has bought|snaps)\b", re.I
+)
 
-def extract_company(text: str) -> str | None:
-    """Best-guess company name from a headline or standfirst."""
+
+def reconcile(text: str) -> tuple[list[Person], str | None]:
+    """People and company, each checked against the other.
+
+    The two extractors can claim the same words. "Kinetic Data sold to US buyer"
+    has exactly the shape of "Gareth Halberton sold…", so one of them must be
+    wrong about it. The tie-break is the strongest evidence of personhood
+    available: a stated job title. "Founder Gareth Halberton" is a person
+    whatever else matches; an untitled capitalised pair that the company
+    extractor found in a company position is a company.
+    """
+    people = extract_people(text)
+    titled = {p.name.lower() for p in people if p.title}
+
+    company = extract_company(text, exclude=sorted(titled))
+    if company:
+        people = [p for p in people if p.name.lower() != company.lower()]
+    return people, company
+
+
+def extract_company(text: str, *, exclude: list[str] | tuple[str, ...] = ()) -> str | None:
+    """The company the story is about — the one that was sold, bought or backed.
+
+    ``exclude`` takes the people already extracted, so "Gareth Halberton sells…"
+    cannot come back as a company called Gareth Halberton.
+    """
+    if not text:
+        return None
+    people = {e.lower() for e in exclude}
+
+    def valid(candidate: str | None) -> str | None:
+        if not candidate:
+            return None
+        name = _trim_company(candidate)
+        if not name:
+            return None
+        if name.lower() in people or any(name.lower() == p.split()[0] for p in people):
+            return None
+        return name
+
+    for pattern in _TARGET_PATTERNS:
+        for match in pattern.finditer(text):
+            name = valid(match.group(1))
+            if name:
+                return name
+
+    # Fallback: an explicit corporate suffix, provided it is not sitting in a
+    # buyer's position. "…acquired by Schmidt Holdings" is the acquirer.
     for match in _COMPANY.finditer(text):
-        words = " ".join(match.group(1).split()).strip(" .,").split()
-        # Only the journalese is stripped. A leading place name is kept, because
-        # companies really are called Marlborough Clinical Holdings.
-        while words and _COMPANY_PREFIX.match(words[0]):
-            words.pop(0)
-        if len(words) < 2:
+        before = text[: match.start()]
+        after = text[match.end():]
+        if _BUYER_CONTEXT.search(before) or _BUYER_FOLLOWS.match(after):
             continue
-        return " ".join(words)
+        name = valid(match.group(1))
+        if name and len(name.split()) >= 2:
+            return name
     return None
 
 
@@ -606,8 +871,7 @@ def extract_event(
     market = MARKET_BY_KEY[match.market_key]
     locality = most_specific_place(text, match.market_key)
     amount = parse_money(text)
-    people = extract_people(text)
-    company = extract_company(text)
+    people, company = reconcile(text)
 
     reasons = [f"Matched a {template.label.lower()} pattern"]
     if match.source == "text":
