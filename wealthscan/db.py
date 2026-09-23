@@ -14,6 +14,7 @@ Schema notes:
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -407,6 +408,66 @@ def slugify(value: str) -> str:
 # ---------------------------------------------------------------------------
 # Writes
 # ---------------------------------------------------------------------------
+
+
+_HONORIFICS = re.compile(
+    r"^(?:mr|mrs|ms|miss|dr|sir|dame|lord|lady|sheikh|sheikha|prof)\.?\s+", re.I
+)
+_COMPANY_NOISE = re.compile(
+    r"\b(?:ltd|limited|plc|llp|llc|inc|corp|group|holdings|the|uk|co)\b\.?", re.I
+)
+
+
+def normalise_name(name: str | None) -> str:
+    cleaned = _HONORIFICS.sub("", (name or "").strip())
+    return " ".join(re.sub(r"[^\w\s'-]", " ", cleaned).lower().split())
+
+
+def normalise_company(company: str | None) -> str:
+    cleaned = _COMPANY_NOISE.sub(" ", (company or "").lower())
+    return " ".join(re.sub(r"[^\w\s]", " ", cleaned).split())
+
+
+def find_person(
+    conn: sqlite3.Connection, *, name: str, company: str | None, market_key: str | None,
+) -> sqlite3.Row | None:
+    """The existing record for this person, if there is one.
+
+    Keyed by name *and* company where a company is known, so a founder reported
+    once by a Devon outlet and once by a London one is one person with two
+    sources, not two half-evidenced records. Same name at a *different* company
+    is never merged: that is at least as likely to be a different person, and
+    merging two people is a worse error than keeping one person twice.
+    """
+    wanted = normalise_name(name)
+    if not wanted:
+        return None
+    rows = conn.execute(
+        "SELECT * FROM prospects WHERE lower(full_name) = ? OR slug LIKE ?",
+        (wanted, f"{slugify(name)}%"),
+    ).fetchall()
+    candidates = [r for r in rows if normalise_name(r["full_name"]) == wanted]
+    if not candidates:
+        return None
+
+    target = normalise_company(company)
+    if target:
+        for row in candidates:
+            if normalise_company(row["company"]) == target:
+                return row
+        # A record with no company yet, in the same market, is the same person
+        # before anyone found out where they worked.
+        for row in candidates:
+            if not row["company"] and row["market_key"] == market_key:
+                return row
+        return None
+
+    # No company to disambiguate on: same market or nothing. A name alone is not
+    # an identity — there are a great many John Smiths.
+    for row in candidates:
+        if row["market_key"] == market_key:
+            return row
+    return None
 
 
 def upsert_prospect(conn: sqlite3.Connection, record: dict[str, Any]) -> tuple[int, bool]:

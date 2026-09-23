@@ -881,6 +881,132 @@ class TestGoogleNewsFeed(unittest.TestCase):
             self.assertGreaterEqual(result.rejected, 1)
 
 
+class TestPriority(unittest.TestCase):
+    """Who to call first. The ranking an advisor needs is not the ranking by
+    wealth, and these pin the cases where the two disagree."""
+
+    NOW = None
+
+    def setUp(self):
+        from datetime import datetime, timezone
+        self.now = datetime(2026, 9, 23, tzinfo=timezone.utc)
+
+    def _score(self, record, days_ago, **kwargs):
+        from datetime import timedelta
+        from wealthscan.priority import prioritise
+        return prioritise(record, latest_source_at=self.now - timedelta(days=days_ago),
+                          source_count=2, now=self.now, **kwargs)
+
+    def test_a_verified_fresh_exit_beats_a_bigger_unverified_name(self):
+        verified = self._score(dict(
+            company="Halberton Precision", investable_mid_gbp=19_000_000,
+            primary_event="Business exit", verification_state="Confirmed",
+            market_key="uk-devon", country="United Kingdom"), 5)
+        bigger = self._score(dict(
+            company=None, investable_mid_gbp=200_000_000,
+            primary_event="Business exit", verification_state="Unconfirmed",
+            market_key="us-texas", country="United States"), 60)
+        self.assertGreater(verified.score, bigger.score)
+
+    def test_an_undisclosed_sale_is_not_scored_as_no_money(self):
+        """"Sold for an undisclosed sum" is one of the commonest shapes of a real
+        exit. No figure is not the same as no money."""
+        undisclosed = self._score(dict(
+            company="Kernow Holidays", investable_mid_gbp=None,
+            primary_event="Business exit", verification_state="Corroborated",
+            market_key="uk-cornwall", country="United Kingdom"), 10)
+        nothing = self._score(dict(
+            company="Kernow Holidays", investable_mid_gbp=None,
+            primary_event="Rapid growth", verification_state="Corroborated",
+            market_key="uk-cornwall", country="United Kingdom"), 10)
+        self.assertGreater(undisclosed.score, nothing.score)
+
+    def test_freshness_matters_most_after_money_has_moved(self):
+        base = dict(company="X Ltd", investable_mid_gbp=10_000_000,
+                    primary_event="Business exit", verification_state="Corroborated",
+                    market_key="uk-devon", country="United Kingdom")
+        self.assertGreater(self._score(base, 5).score, self._score(base, 200).score)
+
+    def test_the_shortlist_leaves_out_what_is_not_ready(self):
+        from datetime import timedelta
+        from wealthscan.priority import shortlist
+        good = dict(full_name="Ready", company="A Ltd", investable_mid_gbp=20_000_000,
+                    primary_event="Business exit", verification_state="Corroborated",
+                    market_key="uk-devon", country="United Kingdom", status="New")
+        unverified = dict(good, full_name="Unverified", verification_state="Unconfirmed")
+        closed = dict(good, full_name="Client already", status="Client")
+        contacted = dict(good, full_name="Called last week")
+        scored = [
+            (good, self._score(good, 5)),
+            (unverified, self._score(unverified, 5)),
+            (closed, self._score(closed, 5)),
+            (contacted, self._score(contacted, 5,
+                                    last_contacted_at=self.now - timedelta(days=6))),
+        ]
+        self.assertEqual([r["full_name"] for r, _ in shortlist(scored)], ["Ready"])
+
+    def test_every_score_explains_itself_and_names_one_action(self):
+        priority = self._score(dict(
+            company="Halberton Precision", investable_mid_gbp=19_000_000,
+            primary_event="Business exit", verification_state="Confirmed",
+            market_key="uk-devon", country="United Kingdom",
+            known_adviser="Ashfords Corporate Finance (corporate finance)"), 5)
+        self.assertIn("Halberton Precision", priority.why_now)
+        self.assertIn("Ashfords Corporate Finance", priority.action)
+        self.assertEqual(sum(c.points for c in priority.components), priority.score)
+        for component in priority.components:
+            self.assertLessEqual(component.points, component.maximum)
+
+    def test_unverified_records_are_told_to_verify_first(self):
+        priority = self._score(dict(
+            company=None, primary_event="Business exit",
+            verification_state="Unconfirmed", market_key="uk-devon"), 5)
+        self.assertIn("Companies House", priority.action)
+
+
+class TestOnePersonOneRecord(unittest.TestCase):
+    """The same founder found by two different searches used to become two
+    records, each with half the evidence and neither able to reach a tier."""
+
+    def _store(self, title, market_key, index):
+        from datetime import datetime, timezone
+        from wealthscan.research import _store_event
+        from wealthscan.sources import Fetcher
+        event = extract_event(
+            title=title, summary="", url=f"https://example.invalid/{index}",
+            publisher="BusinessLive", published_at=datetime.now(timezone.utc),
+            query_event_key="business_exit", query_market_key=market_key,
+        )
+        _store_event(event, fetcher=Fetcher(delay=0), verify_ch=False)
+
+    def test_same_person_same_company_merges_across_markets(self):
+        with TempBook() as db:
+            self._store("Founder Gareth Halberton sells Halberton Precision for £64m",
+                        "uk-devon", 1)
+            self._store("Founder Gareth Halberton sells Halberton Precision to buyer",
+                        "uk-london", 2)
+            with db.connect() as conn:
+                rows = db.all_prospects(conn)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(db.source_count(conn, int(rows[0]["id"])), 2)
+
+    def test_same_name_different_company_is_not_merged(self):
+        """Merging two people is worse than keeping one person twice."""
+        with TempBook() as db:
+            self._store("Founder Gareth Halberton sells Halberton Precision for £64m",
+                        "uk-devon", 1)
+            self._store("Founder Gareth Halberton sells Quayside Marine for £9m",
+                        "uk-cornwall", 2)
+            with db.connect() as conn:
+                self.assertEqual(len(db.all_prospects(conn)), 2)
+
+    def test_matching_ignores_honorifics_and_company_suffixes(self):
+        from wealthscan.db import normalise_company, normalise_name
+        self.assertEqual(normalise_name("Sir Gareth  Halberton"), "gareth halberton")
+        self.assertEqual(normalise_company("Halberton Precision Ltd"),
+                         normalise_company("HALBERTON PRECISION LIMITED"))
+
+
 class TestSourceReliability(unittest.TestCase):
     """A run should report a problem once and act on it, not repeat it forever."""
 

@@ -568,12 +568,14 @@ def _store_person(
         co_principals=co_principals,
     )
 
-    slug = db.slugify(f"{person.name}-{event.market_key}")
-
     with db.connect() as conn:
-        existing = conn.execute(
-            "SELECT id FROM prospects WHERE slug = ?", (slug,)
-        ).fetchone()
+        # One person, one record: match on name and company before minting a new
+        # key, so the same founder found by two different searches is not split
+        # into two half-evidenced records.
+        existing = db.find_person(
+            conn, name=person.name, company=event.company, market_key=event.market_key,
+        )
+        slug = existing["slug"] if existing else db.slugify(f"{person.name}-{event.market_key}")
         prior_sources = db.source_count(conn, int(existing["id"])) if existing else 0
 
         confidence = score_confidence(
@@ -806,7 +808,14 @@ def resolve_lead_with_register(lead_id: int, *, fetcher: Fetcher | None = None) 
             location_from_text=True,
         )
 
-        slug = db.slugify(f"{principal.name}-{lead['market_key']}")
+        with db.connect() as conn:
+            existing = db.find_person(
+                conn, name=principal.name,
+                company=company.company_name if company else lead["company"],
+                market_key=lead["market_key"],
+            )
+        slug = (existing["slug"] if existing
+                else db.slugify(f"{principal.name}-{lead['market_key']}"))
         record = {
             "slug": slug,
             "full_name": principal.name,
