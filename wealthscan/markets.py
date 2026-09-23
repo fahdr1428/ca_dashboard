@@ -573,6 +573,30 @@ def resolve_market(
     return best
 
 
+def market_for_place(location: str | None) -> Market | None:
+    """The market for a place someone typed, rather than one found in prose.
+
+    Text resolution treats "Bath" as ambiguous because articles about bathrooms
+    outnumber articles about Somerset. A location field is not prose: an advisor
+    typing "Bath" means the city. So an exact place-name match is taken first,
+    and only then the cautious text resolver.
+    """
+    if not location or not location.strip():
+        return None
+    wanted = location.strip().lower()
+    for market in ALL_MARKETS:
+        if wanted == market.name.lower() or any(wanted == p.lower() for p in market.places):
+            return market
+    # "Truro, Cornwall" or "Clifton, Bristol BS8": try each comma-separated part.
+    for part in (p.strip() for p in location.split(",")):
+        lowered = part.lower()
+        for market in ALL_MARKETS:
+            if lowered and any(lowered == p.lower() for p in market.places):
+                return market
+    match = resolve_market(location)
+    return MARKET_BY_KEY.get(match.market_key) if match else None
+
+
 def most_specific_place(text: str | None, market_key: str) -> str | None:
     """The narrowest place named in the text — a town rather than the county.
 

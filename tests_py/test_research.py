@@ -881,6 +881,103 @@ class TestGoogleNewsFeed(unittest.TestCase):
             self.assertGreaterEqual(result.rejected, 1)
 
 
+class TestWorkbench(unittest.TestCase):
+    """The advisor's own research going back into the book — through the same
+    screening and grading as the sweep, never around it."""
+
+    URL = "https://www.insidermedia.com/news/south-west/kernow-holidays-sold"
+
+    def _add(self, **overrides):
+        from wealthscan.workbench import add_prospect
+        kwargs = dict(full_name="Anna Pellow", company="Kernow Holidays",
+                      job_title="Founder", source_url=self.URL, location="Truro",
+                      event_key="business_exit", amount_text="£18m", added_by="AB")
+        kwargs.update(overrides)
+        return add_prospect(**kwargs)
+
+    def test_a_hand_entered_record_needs_a_source(self):
+        with TempBook():
+            result = self._add(source_url="")
+            self.assertFalse(result.ok)
+            self.assertIn("web address", result.message)
+
+    def test_hand_entry_is_screened_like_everything_else(self):
+        with TempBook():
+            result = self._add(full_name="Callum Vane", job_title="Footballer")
+            self.assertFalse(result.ok)
+            self.assertIn("sport", result.message.lower())
+
+    def test_confirmation_needs_the_number_it_was_made_against(self):
+        """"I looked them up" with nothing recorded is not an audit trail."""
+        from wealthscan.workbench import verify_manually
+        with TempBook():
+            pid = self._add().prospect_ids[0]
+            refused = verify_manually(pid, verified_by="AB", officer_confirmed=True)
+            self.assertFalse(refused.ok)
+            self.assertIn("company number", refused.message)
+
+    def test_manual_confirmation_upgrades_the_record_and_keeps_a_trail(self):
+        from wealthscan.workbench import verify_manually
+        with TempBook() as db:
+            pid = self._add().prospect_ids[0]
+            result = verify_manually(pid, verified_by="AB", company_number="7890123",
+                                     officer_confirmed=True, ownership_band="50–75%")
+            self.assertTrue(result.ok, result.message)
+            self.assertEqual(result.new_state, "Confirmed")
+            with db.connect() as conn:
+                row = db.prospect(conn, pid)
+                self.assertEqual(row["ch_company_number"], "07890123", "zero-padded")
+                self.assertEqual(row["evidence_grade"], "High")
+                self.assertIn("AB", row["evidence_basis"])
+                events = [e["message"] for e in db.prospect_events(conn, pid)]
+                self.assertTrue(any("Verified by AB" in m for m in events))
+
+    def test_company_numbers_are_validated(self):
+        from wealthscan.workbench import normalise_company_number
+        self.assertEqual(normalise_company_number("7890123"), "07890123")
+        self.assertEqual(normalise_company_number("sc 123456"), "SC123456")
+        self.assertEqual(normalise_company_number("OC301234"), "OC301234")
+        self.assertIsNone(normalise_company_number("12AB"))
+        self.assertIsNone(normalise_company_number("123456789"))
+
+    def test_a_typed_location_is_not_treated_like_prose(self):
+        """"Bath" in an article is usually a bathroom. "Bath" in a location field
+        is the city."""
+        from wealthscan.markets import market_for_place
+        self.assertEqual(market_for_place("Bath").name, "Somerset")
+        self.assertEqual(market_for_place("Truro, Cornwall").name, "Cornwall")
+        self.assertIsNone(market_for_place("Somewhere Else"))
+
+    def test_an_export_maps_itself_and_imports_through_the_screen(self):
+        from wealthscan.workbench import guess_mapping, import_rows
+        columns = ["Company name", "Companies House ID", "Director name", "Role",
+                   "HQ location", "Beauhurst URL"]
+        mapping = guess_mapping(columns)
+        self.assertEqual(mapping["full_name"], "Director name")
+        self.assertEqual(mapping["company"], "Company name")
+        self.assertEqual(mapping["company_number"], "Companies House ID")
+        self.assertEqual(mapping["location"], "HQ location")
+        with TempBook() as db:
+            summary = import_rows([
+                {"Company name": "Wessex Tooling", "Director name": "Robert Tresize",
+                 "Role": "Managing Director", "HQ location": "Taunton",
+                 "Companies House ID": "04567890"},
+                {"Company name": "Quayside Marine", "Director name": "",
+                 "HQ location": "Falmouth"},
+                {"Company name": "Big Club", "Director name": "Callum Vane",
+                 "Role": "Footballer", "HQ location": "Bath"},
+            ], mapping, source_label="Beauhurst export", default_market_key="uk-devon")
+            self.assertEqual(summary.added, 1)
+            self.assertEqual(summary.leads, 1, "a company with no person goes to the worklist")
+            self.assertEqual(len(summary.refused), 1, "the footballer is screened out")
+            with db.connect() as conn:
+                row = next(r for r in db.all_prospects(conn)
+                           if r["full_name"] == "Robert Tresize")
+                self.assertEqual(row["market_name"], "Somerset",
+                                 "the row's own location beats the default")
+                self.assertEqual(row["ch_company_number"], "04567890")
+
+
 class TestPriority(unittest.TestCase):
     """Who to call first. The ranking an advisor needs is not the ranking by
     wealth, and these pin the cases where the two disagree."""
