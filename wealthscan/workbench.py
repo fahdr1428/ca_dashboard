@@ -279,6 +279,9 @@ def add_prospect(
 
     outcome = _store_event(event, fetcher=Fetcher(delay=0.0), verify_ch=False)
 
+    if outcome["kind"] == "excluded":
+        return AddResult(False, f"Not added: {outcome['name']} is above the £250m "
+                                f"wealth ceiling — see Screened out.")
     if outcome["kind"] == "company_lead":
         return AddResult(True, f"{company} added to Find the owner — no person named.",
                          lead=True)

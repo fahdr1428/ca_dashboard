@@ -550,6 +550,9 @@ def main() -> int:
             created += 1
             print(f"  + {str(outcome['name'])[:24]:24} {event.market_name[:20]:20} "
                   f"{event.event_label}")
+        elif kind == "excluded":
+            excluded += 1
+            print(f"  ✕ excluded (mega-wealth): {str(outcome['name'])[:40]}")
         elif kind == "updated":
             updated += 1
             print(f"  ~ {str(outcome['name'])[:24]:24} corroborated with {event.event_label}")

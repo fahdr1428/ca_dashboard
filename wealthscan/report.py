@@ -17,10 +17,15 @@ from .config import PRIORITY_THRESHOLD_GBP, QUALIFYING_THRESHOLD_GBP
 
 
 def fmt_gbp(amount: int | float | None) -> str:
-    """Compact GBP. Returns an em dash for None, never "£0"."""
+    """Compact GBP. Returns an em dash for None or NaN, never "£0" or "£nan"."""
     if amount is None:
         return "—"
-    value = float(amount)
+    try:
+        value = float(amount)
+    except (TypeError, ValueError):
+        return "—"
+    if value != value:  # NaN — how pandas spells a missing figure
+        return "—"
     if abs(value) >= 1_000_000_000:
         return f"£{value / 1_000_000_000:.2f}bn"
     if abs(value) >= 1_000_000:

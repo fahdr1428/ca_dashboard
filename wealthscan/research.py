@@ -342,6 +342,9 @@ def process_article(
         result.updated_prospects += 1 + int(outcome.get("extra_updated", 0) or 0)
     elif outcome["kind"] == "company_lead":
         result.company_leads += 1
+    elif outcome["kind"] == "excluded":
+        result.excluded += 1
+        result.log.append(f"Screened out · {outcome['name']} · above the wealth ceiling")
     return outcome
 
 
@@ -524,6 +527,11 @@ def _store_event(
                       co_principals=len(principals))
         for person in principals
     ]
+    kept = [o for o in outcomes if o["kind"] != "excluded"]
+    if not kept:
+        return {"kind": "excluded", "name": ", ".join(str(o["name"]) for o in outcomes),
+                "prospect_ids": [], "ch_warning": None}
+    outcomes = kept
     created = [o for o in outcomes if o["kind"] == "new"]
     return {
         "kind": "new" if created else "updated",
@@ -575,6 +583,26 @@ def _store_person(
         known_stake_band=ch_match.ownership_band if ch_match else None,
         co_principals=co_principals,
     )
+
+    # The rich-list ceiling can only be applied once there is a figure — the
+    # first screen runs before any estimate exists, which is how £300m names
+    # were reaching the list. For a funding round the valuation is itself
+    # implied from the raise, so the conservative end is used there: a crude
+    # guess should not be what removes somebody.
+    ceiling_basis = (
+        estimate.gross_low_gbp if event.event_key == "venture_funding"
+        else estimate.gross_mid_gbp
+    )
+    too_big = screen(text="", gross_wealth_gbp=ceiling_basis)
+    if too_big is not None:
+        with db.connect() as conn:
+            db.record_exclusion(conn, {
+                "rule": too_big.rule, "reason": too_big.reason,
+                "person_name": person.name, "company": event.company,
+                "title": event.title, "url": event.url, "publisher": event.publisher,
+            })
+        return {"kind": "excluded", "name": person.name, "prospect_id": None,
+                "ch_warning": ch_warning}
 
     with db.connect() as conn:
         # One person, one record: match on name and company before minting a new
@@ -806,6 +834,16 @@ def resolve_lead_with_register(lead_id: int, *, fetcher: Fetcher | None = None) 
                 f"salaried director would invent a figure — a director of a sold "
                 f"business may receive nothing at all."
             )
+        too_big = screen(text="", gross_wealth_gbp=estimate.gross_mid_gbp)
+        if too_big is not None:
+            with db.connect() as conn:
+                db.record_exclusion(conn, {
+                    "rule": too_big.rule, "reason": too_big.reason,
+                    "person_name": principal.name, "company": lead["company"],
+                    "title": lead["title"], "url": lead["url"],
+                    "publisher": lead["publisher"],
+                })
+            continue
 
         confidence = score_confidence(
             publisher="Companies House",

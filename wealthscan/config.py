@@ -63,6 +63,13 @@ class WealthModel:
     assumed_founder_stake_mid: float = 0.55
     assumed_founder_stake_high: float = 0.75
 
+    # A landowner selling their own land. Unlike a company, an estate is usually
+    # held by the family itself — often jointly, or through a partnership or
+    # trust — so the default is most of it, not a founder's majority.
+    assumed_land_stake_low: float = 0.50
+    assumed_land_stake_mid: float = 0.85
+    assumed_land_stake_high: float = 1.00
+
     # Effective capital gains tax on a business disposal (blend of Business
     # Asset Disposal Relief band and the main rate).
     exit_tax_rate: float = 0.22
@@ -94,6 +101,7 @@ MODEL = WealthModel()
 
 ASSUMPTION_NOTES: dict[str, str] = {
     "assumed_founder_stake_mid": "Where a stake is unknown, a founder is assumed to hold 55% (range 35-75%).",
+    "assumed_land_stake_mid": "Where a landowner sells their own land, they are assumed to hold 85% of it (range 50-100%) — estates are usually family-held, often jointly or in trust.",
     "exit_tax_rate": "22% effective capital gains tax applied to disposal proceeds.",
     "dividend_tax_rate": "39.35% additional-rate dividend tax applied to distributions.",
     "retention_rate": "75% of post-tax proceeds assumed retained rather than spent.",

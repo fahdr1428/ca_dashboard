@@ -79,7 +79,7 @@ that is created and then hidden still turns up in exports and totals:
 | Refused | Why |
 | --- | --- |
 | Sport, entertainment, broadcasting | Not realistic introductions. Already served through networks the firm does not sit in, and a public profile makes cold outreach unworkable. |
-| Gross wealth above £250m | National rich-list names are not addressable by a regional private-client firm. |
+| Gross wealth above £250m | National rich-list names are not addressable by a regional private-client firm. Applied once the estimate exists — to the midpoint, or for a funding round (where the valuation is itself implied) to the conservative end. |
 | "Estimated net worth" aggregators | Numbers with no method, no filing and no correction process. Refused **on the domain**, whatever the page says. |
 
 Every refusal is logged with its reason on the **Screened out** page. A screening
@@ -113,6 +113,11 @@ Corroboration is not a substitute for an entity.
 
 Each record shows its checklist — which checks passed, which did not, and the
 single next step that would move it up a tier.
+
+Land sales are also priced differently: a landowner selling their own land is
+assumed to hold 85% of it (range 50–100%), not a founder's 55%, because estates
+are usually family-held. Co-founders split the assumed stake on every kind of
+event — sales, funding rounds and flotations alike.
 
 **Land is the exception to "no company, no prospect".** For estate and farming
 wealth the vehicle is land and the register is HM Land Registry. When the source
@@ -437,7 +442,7 @@ wealthscan/
 scripts/
   run_research.py           CLI for a scheduler
   seed_demo.py              52 fictional prospects
-tests_py/test_research.py   137 tests
+tests_py/test_research.py   142 tests
 ```
 
 Run the tests with `python -m unittest discover -s tests_py -v`.

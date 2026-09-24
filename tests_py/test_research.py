@@ -1742,5 +1742,59 @@ class TestInterfaceLogic(unittest.TestCase):
         self.assertFalse(is_web_link("import://Beauhurst export/jane-example"))
         self.assertFalse(is_web_link(None))
 
+class TestPricing(unittest.TestCase):
+    """The figures an advisor reads: each assumption applied once, and only where it fits."""
+
+    def _estimate(self, **kwargs):
+        from wealthscan.scoring import estimate_from_event
+        base = dict(amount_gbp=100_000_000, text="", has_named_person=True)
+        base.update(kwargs)
+        return estimate_from_event(**base)
+
+    def test_co_founders_share_a_funding_round_rather_than_each_owning_it(self):
+        alone = self._estimate(event_key="venture_funding", text="Series B")
+        pair = self._estimate(event_key="venture_funding", text="Series B", co_principals=2)
+        self.assertAlmostEqual(pair.gross_mid_gbp, alone.gross_mid_gbp / 2, delta=2)
+        self.assertTrue(any("split equally" in c for c in pair.caveats))
+
+    def test_co_founders_share_a_flotation_too(self):
+        alone = self._estimate(event_key="ipo")
+        pair = self._estimate(event_key="ipo", co_principals=2)
+        self.assertAlmostEqual(pair.gross_mid_gbp, alone.gross_mid_gbp / 2, delta=2)
+
+    def test_a_landowner_is_assumed_to_own_most_of_their_own_land(self):
+        from wealthscan.config import MODEL
+        land = self._estimate(event_key="land_sale", amount_gbp=14_800_000)
+        sale = self._estimate(event_key="business_exit", amount_gbp=14_800_000)
+        self.assertGreater(land.gross_mid_gbp, sale.gross_mid_gbp)
+        self.assertEqual(land.gross_mid_gbp,
+                         int(14_800_000 * MODEL.assumed_land_stake_mid
+                             * (1 - MODEL.exit_tax_rate)))
+        self.assertTrue(any("Land Registry" in c for c in land.caveats))
+
+    def test_the_rich_list_ceiling_applies_once_there_is_a_figure(self):
+        from wealthscan.workbench import add_prospect
+        with TempBook() as db:
+            result = add_prospect(
+                full_name="Jane Example", company="Example Group Ltd", job_title="Founder",
+                location="Bath", event_key="business_exit", amount_text="£900m",
+                source_url="https://www.example.com/news/example-group-sold",
+            )
+            self.assertFalse(result.ok)
+            self.assertIn("ceiling", result.message)
+            with db.connect() as conn:
+                self.assertEqual(len(db.all_prospects(conn)), 0)
+                self.assertEqual(db.exclusions(conn)[0]["rule"], "mega-wealth")
+
+    def test_a_business_below_the_ceiling_is_kept(self):
+        from wealthscan.workbench import add_prospect
+        with TempBook():
+            result = add_prospect(
+                full_name="Jane Example", company="Example Group Ltd", job_title="Founder",
+                location="Bath", event_key="business_exit", amount_text="£60m",
+                source_url="https://www.example.com/news/example-group-sold",
+            )
+            self.assertTrue(result.ok, result.message)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

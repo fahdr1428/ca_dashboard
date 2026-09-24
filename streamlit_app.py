@@ -75,6 +75,7 @@ from ui.common import (
     load_reports,
     load_sources_index,
     masthead,
+    money_display,
     refresh,
     where_text,
 )
@@ -656,9 +657,9 @@ def page_list(frame: pd.DataFrame) -> None:
         # Coerced to numeric so an all-empty column renders blank rather than a
         # column of the word "None" — which reads as a stated fact about someone's
         # revenue, and is the same class of error as showing £0.
-        "Est. net worth £": pd.to_numeric(view["investable_mid_gbp"], errors="coerce"),
-        "Co. revenue £": pd.to_numeric(view["company_revenue_gbp"], errors="coerce"),
-        "Est. income £": pd.to_numeric(view["annual_income_gbp"], errors="coerce"),
+        "Est. net worth": pd.to_numeric(view["investable_mid_gbp"], errors="coerce"),
+        "Co. revenue": pd.to_numeric(view["company_revenue_gbp"], errors="coerce"),
+        "Est. income": pd.to_numeric(view["annual_income_gbp"], errors="coerce"),
         "Verified": view["verification_state"].fillna("Unconfirmed"),
         "Sector": view["sector"].fillna("—"),
         "Evidence": view["evidence_grade"].fillna("Low"),
@@ -671,7 +672,7 @@ def page_list(frame: pd.DataFrame) -> None:
     }).reset_index(drop=True)
 
     selection = st.dataframe(
-        table,
+        money_display(table, ["Est. net worth", "Co. revenue", "Est. income"]),
         hide_index=True,
         width="stretch",
         height=min(520, 60 + 36 * len(table)),
@@ -691,19 +692,19 @@ def page_list(frame: pd.DataFrame) -> None:
                 help="Public (traded shares) or private (Companies House only).",
             ),
             "Where": st.column_config.TextColumn(width="medium"),
-            "Est. net worth £": st.column_config.NumberColumn(
-                "Est. net worth £", format="compact",
+            "Est. net worth": st.column_config.NumberColumn(
+                "Est. net worth",
                 help="ESTIMATE of investable assets, in GBP, modelled from public "
                      "reporting — not a verified figure. Blank means the app declined "
                      "to put a number on the evidence; it never means zero.",
             ),
-            "Co. revenue £": st.column_config.NumberColumn(
-                "Co. revenue £", format="compact",
+            "Co. revenue": st.column_config.NumberColumn(
+                "Co. revenue",
                 help="Filed or reported company turnover. Blank means not publicly "
                      "disclosed.",
             ),
-            "Est. income £": st.column_config.NumberColumn(
-                "Est. income £", format="compact",
+            "Est. income": st.column_config.NumberColumn(
+                "Est. income",
                 help="Annual remuneration or attributable dividend. Disclosed exactly "
                      "for listed-company pay; modelled from an assumed stake for "
                      "dividends. Blank means not publicly disclosed.",
@@ -743,9 +744,8 @@ def page_list(frame: pd.DataFrame) -> None:
     # spelled out — once, alongside how to use the table.
     st.caption(
         "Tick the box at the start of a row to open that person's record below. Click a "
-        "heading to sort; columns continue to the right. **A blank or “None” in a money "
-        "column means not publicly disclosed — never zero.** Every figure is a modelled "
-        "estimate unless the record says it was disclosed."
+        "heading to sort; columns continue to the right. Every figure is a modelled "
+        "estimate unless the record says it was disclosed; “not disclosed” never means zero."
     )
 
     # Which record is open is remembered by person, not by row position: saving a
@@ -857,7 +857,9 @@ def page_overview(frame: pd.DataFrame) -> None:
     columns[1].metric("New this week", len(this_week))
     columns[2].metric("Qualifying", len(qualifying), help="£7.5m+ estimated investable assets")
     columns[3].metric("Pre-liquidity", len(pre_liquidity), help="£15m+ gross, not yet liquid")
-    columns[4].metric("Addressable", fmt_gbp(qualifying["investable_mid_gbp"].sum()))
+    addressable = qualifying["investable_mid_gbp"].sum()
+    columns[4].metric("Est. addressable", fmt_gbp(addressable) if addressable else "—",
+                      help="Sum of ESTIMATED investable assets across qualifying people.")
     columns[5].metric("Verified", int(frame["ch_officer_name"].notna().sum()),
                       help="Matched to a filed Companies House record")
     estimate_disclaimer()
@@ -919,13 +921,10 @@ def page_overview(frame: pd.DataFrame) -> None:
             .sort_values("people", ascending=False)
         )
         st.dataframe(
-            by_country.rename(columns={
-                "country": "Country", "people": "People", "addressable": "Addressable (£)",
-            }),
+            money_display(by_country.rename(columns={
+                "country": "Country", "people": "People", "addressable": "Est. addressable",
+            }), ["Est. addressable"]),
             hide_index=True, width="stretch",
-            column_config={
-                "Addressable (£)": st.column_config.NumberColumn(format="compact"),
-            },
         )
 
         st.subheader("Wealth bands")
@@ -983,18 +982,17 @@ def page_overview(frame: pd.DataFrame) -> None:
     st.subheader("Highest estimated investable assets")
     ranked = frame.sort_values("investable_mid_gbp", ascending=False, na_position="last").head(20)
     st.dataframe(
-        pd.DataFrame({
+        money_display(pd.DataFrame({
             "Name": ranked["full_name"],
             "Company": ranked["company"].fillna("—"),
             "Where": ranked.apply(where_text, axis=1),
             "Found via": ranked["primary_event"].fillna("—"),
-            "Est. investable": ranked["investable_mid_gbp"],
+            "Est. investable": pd.to_numeric(ranked["investable_mid_gbp"], errors="coerce"),
             "Band": ranked["wealth_band"],
             "Confidence": ranked["confidence"],
-        }),
+        }), ["Est. investable"], missing="not estimated"),
         hide_index=True, width="stretch",
         column_config={
-            "Est. investable": st.column_config.NumberColumn(format="compact"),
             "Confidence": st.column_config.ProgressColumn(
                 min_value=0, max_value=100, format="%d"
             ),

@@ -17,7 +17,7 @@ import streamlit as st
 from wealthscan import db
 from wealthscan.markets import MARKET_BY_KEY
 from wealthscan.priority import prioritise
-from wealthscan.report import fmt_gbp  # noqa: F401 - re-exported for the pages
+from wealthscan.report import fmt_gbp
 
 try:  # Streamlit implements rerun and stop as exceptions; let those through.
     from streamlit.runtime.scriptrunner_utils.exceptions import ScriptControlException
@@ -215,6 +215,17 @@ def estimate_disclaimer() -> None:
         "verified statement of wealth. A blank or “None” means not publicly "
         "disclosed — never zero."
     )
+
+
+def money_display(table: pd.DataFrame, columns: list[str], missing: str = "not disclosed"):
+    """Money columns shown as "£22.2m", blanks as words — still sorted as numbers.
+
+    Streamlit renders a compact number as a bare "22M" and an empty cell as a
+    grey "None", which in a table of someone's wealth reads as a statement of
+    fact. The styler changes only what is displayed; sorting uses the numbers.
+    """
+    present_columns = [c for c in columns if c in table.columns]
+    return table.style.format(fmt_gbp, subset=present_columns, na_rep=missing)
 
 
 def present(row, key: str) -> bool:

@@ -188,16 +188,20 @@ def estimate_from_event(
                       text, re.I)
         )
         filed = parse_ownership_band(known_stake_band)
+        land = event_key == "land_sale"
         if filed:
             lows, mids, highs = filed
         else:
             # Split between everyone the source names, or the same transaction
-            # gets counted once per co-founder.
-            lows, mids, highs = (
-                MODEL.assumed_founder_stake_low / co_principals,
-                MODEL.assumed_founder_stake_mid / co_principals,
-                MODEL.assumed_founder_stake_high / co_principals,
+            # gets counted once per co-founder. Land sold by its owner is priced
+            # off a different default: estates are family-held, not founder-led.
+            base = (
+                (MODEL.assumed_land_stake_low, MODEL.assumed_land_stake_mid,
+                 MODEL.assumed_land_stake_high) if land else
+                (MODEL.assumed_founder_stake_low, MODEL.assumed_founder_stake_mid,
+                 MODEL.assumed_founder_stake_high)
             )
+            lows, mids, highs = (share / co_principals for share in base)
         after_tax = 1 - MODEL.exit_tax_rate
         gross_low = int(amount_gbp * lows * after_tax)
         gross_mid = int(amount_gbp * mids * after_tax)
@@ -232,7 +236,11 @@ def estimate_from_event(
                     "so its midpoint is still an approximation.",
                 ]
                 if filed
-                else [
+                else ([
+                    "Land is often held jointly, or through a family partnership or "
+                    "trust, and the sale price is for the land — not what reached this "
+                    "person. Confirm the registered proprietor at HM Land Registry.",
+                ] if land else []) + [
                     "The individual's actual shareholding is not stated in the source. "
                     "The stake is an assumption and is the single largest source of error "
                     "in this figure — verify it on the Companies House PSC register before "
@@ -282,6 +290,8 @@ def estimate_from_event(
                 "will have moved since."
             )
 
+        # Co-founders share the founder stake; each is not the whole of it.
+        founder_share = founder_share / co_principals
         gross_low = int(post_low * founder_share * 0.6)
         gross_mid = int(post_mid * founder_share)
         gross_high = int(post_high * founder_share * 1.4)
@@ -299,6 +309,10 @@ def estimate_from_event(
             ),
             caveats=[
                 extra_caveat,
+            ] + ([
+                f"The source names {co_principals} principals, so the assumed founder "
+                f"stake is split equally between them.",
+            ] if co_principals > 1 else []) + [
                 "This is paper wealth. The individual may have very little "
                 "investable cash despite a large headline figure — which is exactly "
                 "why the relationship is worth building before an exit, not after.",
