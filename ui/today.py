@@ -13,19 +13,24 @@ import streamlit as st
 
 from wealthscan import db
 from wealthscan.config import QUALIFYING_THRESHOLD_GBP
+from wealthscan.markets import DEFAULT_PRESET, PRESETS
 from wealthscan.priority import CLOSED_STATUSES
+from wealthscan.queries import DEFAULT_DEPTH
 
 from .common import (
     estimate_disclaimer,
     fmt_gbp,
     guarded,
+    is_web_link,
     load_lead_count,
     load_prospects,
+    load_sources_index,
     present,
     state_pill,
     value,
     where_text,
 )
+from . import sweeps
 from .record import render_record
 
 SHORTLIST_SIZE = 10
@@ -56,6 +61,94 @@ def to_check_frame(frame: pd.DataFrame, size: int = 5) -> pd.DataFrame:
     ).head(size)
 
 
+def call_sheet_csv(shortlist: pd.DataFrame) -> str:
+    """The call list as a sheet to work from: who, why, how, and what to say first."""
+    sources = load_sources_index()
+
+    def links(prospect_id) -> str:
+        return " | ".join(
+            str(s["url"]) for s in sources.get(int(prospect_id), []) if is_web_link(s.get("url"))
+        )
+
+    def text(row, key) -> str:
+        return str(value(row, key, "")) if present(row, key) else ""
+
+    sheet = pd.DataFrame([{
+        "rank": rank,
+        "priority": int(value(row, "priority", 0)),
+        "name": row["full_name"],
+        "role": text(row, "job_title"),
+        "company": text(row, "company"),
+        "companies_house_number": text(row, "ch_company_number"),
+        "where": where_text(row),
+        "verification": text(row, "verification_state"),
+        "why_now": text(row, "why_now"),
+        "next_step": text(row, "next_step"),
+        "known_adviser": text(row, "known_adviser"),
+        "registered_office": text(row, "ch_registered_office") or text(row, "address"),
+        "est_investable_ESTIMATE": fmt_gbp(row["investable_mid_gbp"])
+        if present(row, "investable_mid_gbp") else "not estimated",
+        "est_annual_income_ESTIMATE": fmt_gbp(row["annual_income_gbp"])
+        if present(row, "annual_income_gbp") else "not disclosed",
+        "sources": links(row["id"]),
+        "outcome": "",
+        "notes": "",
+    } for rank, (_, row) in enumerate(shortlist.iterrows(), start=1)])
+    return (
+        "# Call sheet. Figures marked ESTIMATE are modelled from public reporting, not "
+        "verified statements of wealth. Never quote them to the person.\n"
+        + sheet.to_csv(index=False)
+    )
+
+
+def _search_prompt(frame: pd.DataFrame) -> None:
+    """Start a search from here, or watch the one that is running."""
+    job = sweeps.current_job()
+    if sweeps.is_running():
+        sweeps.live_progress()
+        return
+    with db.connect() as conn:
+        due = db.run_due_this_week(conn)
+    if not frame.empty and not due:
+        if job is not None and job.done and job.result is not None \
+                and st.session_state.get("_today_result_shown") != job.started:
+            st.session_state["_today_result_shown"] = job.started
+            st.toast(f"Search finished: {job.result.new_prospects} new people.")
+        return
+
+    with st.container(border=True):
+        if frame.empty:
+            st.markdown("**Nothing on file yet — start with a search of your patch.**")
+            st.caption(
+                "Bristol, Bath, London and the South West. The quick search reads the "
+                "freshest deal news in under a minute; the deep search takes about a "
+                "quarter of an hour and finds far more. Both run in the background."
+            )
+        else:
+            st.markdown("**This week's search is due.**")
+            st.caption(
+                "Articles already read are skipped, so nothing is duplicated. It runs in "
+                "the background — carry on working."
+            )
+        buttons = st.columns([1, 1, 2])
+        keys = list(PRESETS[DEFAULT_PRESET])
+        if buttons[0].button("Quick search (≈1 min)", width="stretch",
+                             type="secondary" if not frame.empty else "primary"):
+            sweeps.start_sweep("Quick search of your patch", trigger="manual",
+                               depth="quick", market_keys=keys)
+            st.rerun()
+        if buttons[1].button("Deep search (≈15 min)", width="stretch",
+                             type="primary" if not frame.empty else "secondary"):
+            sweeps.start_sweep("Deep search of your patch", trigger="manual",
+                               depth=DEFAULT_DEPTH, market_keys=keys,
+                               time_budget_seconds=20 * 60)
+            st.rerun()
+        buttons[2].caption("Or choose markets and depth yourself on **Find prospects**, "
+                           "or bring in your own list through **Add & import**.")
+        if frame.empty and job is not None and job.done:
+            sweeps.show_result(job)
+
+
 @st.dialog("Prospect record", width="large")
 def _open_record(prospect_id: int) -> None:
     # Re-read the book each time so a save made inside the dialog is reflected
@@ -76,11 +169,10 @@ def page_today(frame: pd.DataFrame) -> None:
         "patch. Anyone approached in the last month is held back."
     )
 
+    with guarded("The search controls"):
+        _search_prompt(frame)
+
     if frame.empty:
-        st.info(
-            "**Nothing on file yet.** Open **Find prospects** to run a sweep, or "
-            "**Add & import** to bring in a list you already have."
-        )
         return
 
     shortlist = shortlist_frame(frame)
@@ -107,7 +199,16 @@ def page_today(frame: pd.DataFrame) -> None:
             "below is where the next ones will come from."
         )
     else:
-        st.subheader(f"Call list — {len(shortlist)} people")
+        head = st.columns([3, 1])
+        head[0].subheader(f"Call list — {len(shortlist)} people")
+        with head[1]:
+            st.download_button(
+                "Download call sheet", data=call_sheet_csv(shortlist),
+                file_name=f"call-sheet-{db.iso_week()}.csv", mime="text/csv",
+                width="stretch",
+                help="Today's list with the reason, next step, route in and sources — "
+                     "for a call session away from the app.",
+            )
         for rank, (_, row) in enumerate(shortlist.iterrows(), start=1):
             with guarded(f"The card for {row['full_name']}"):
                 _card(rank, row)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import platform
 import sqlite3
+from datetime import datetime, timezone
 
 import pandas as pd
 import streamlit as st
@@ -18,7 +19,8 @@ from wealthscan import db
 from wealthscan.queries import DIRECT_FEEDS, google_news_url
 from wealthscan.sources import Fetcher, companies_house_status, fetch_feed
 
-from .common import guarded, load_prospects
+from .common import guarded, load_prospects, refresh
+from .sweeps import is_running
 
 
 def page_system() -> None:
@@ -30,6 +32,9 @@ def page_system() -> None:
 
     with guarded("The book"):
         _book()
+    st.divider()
+    with guarded("Backup and restore"):
+        _backup()
     st.divider()
     with guarded("The live checks"):
         _live_checks()
@@ -76,6 +81,50 @@ def _book() -> None:
     else:
         st.caption("No sweep has run on this installation yet.")
     st.caption(f"Database file: `{db.DB_PATH}`")
+
+
+def _backup() -> None:
+    st.subheader("Back up and restore")
+    st.caption(
+        "**Streamlit Community Cloud resets the app's files whenever it restarts** — "
+        "after a redeploy, or a spell of inactivity. Your notes, verifications and "
+        "contact log go with them. Download a backup after any session where you "
+        "changed something, and restore it if the book comes back empty."
+    )
+    left, right = st.columns(2)
+    with left:
+        st.markdown("**Download a backup**")
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d-%H%M")
+        st.download_button(
+            "Download the whole book", data=db.backup_bytes(),
+            file_name=f"lead-intelligence-backup-{stamp}.db",
+            mime="application/octet-stream", type="primary", width="stretch",
+        )
+        st.caption("One file: every person, source, note, verification and contact.")
+    with right:
+        st.markdown("**Restore from a backup**")
+        upload = st.file_uploader("Backup file", type=["db"], label_visibility="collapsed")
+        if upload is not None:
+            raw = upload.getvalue()
+            try:
+                counts = db.backup_summary(raw)
+            except ValueError as error:
+                st.error(str(error))
+                return
+            st.info(
+                f"This backup holds **{counts['prospects']} people**, "
+                f"{counts['sources']} sources and {counts.get('contacts', 0)} logged "
+                f"contacts. Restoring **replaces** the current book."
+            )
+            sure = st.checkbox("Replace the current book with this backup")
+            if st.button("Restore", disabled=not sure, width="stretch"):
+                if is_running():
+                    st.warning("A search is running. Wait for it to finish, then restore.")
+                    return
+                db.restore_bytes(raw)
+                refresh()
+                st.success(f"Restored {counts['prospects']} people.")
+                st.rerun()
 
 
 def _live_checks() -> None:

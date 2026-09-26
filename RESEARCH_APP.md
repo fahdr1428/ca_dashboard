@@ -28,7 +28,7 @@ Grouped in the sidebar by what you are doing.
 
 | Group | Page | What it is for |
 | --- | --- | --- |
-| Work | **Today** (opens here) | The call list: verified, open, not approached this month, ranked by priority — each with *why now* and the one next step. Below it, the unconfirmed names most worth ten minutes of checking |
+| Work | **Today** (opens here) | The call list: verified, open, not approached this month, ranked by priority — each with *why now* and the one next step, downloadable as a **call sheet**. Below it, the unconfirmed names most worth ten minutes of checking. When the book is empty or this week's search is due, one click starts a quick or deep search of your patch |
 | Work | **Prospect list** | One sortable, filterable table of everyone, sorted by priority. Tick a row, or type a name, to open the record underneath; it stays open while you work on it |
 | Work | **Find the owner** | Real transactions the press left unnamed, and a one-click register lookup to name them |
 | Research | **Find prospects** | Choose where to look and how hard, see the cost, press go |
@@ -37,7 +37,15 @@ Grouped in the sidebar by what you are doing.
 | Research | **Weekly document** | The Monday write-up: who is new, why, what each figure rests on |
 | About | **Screened out** | Who the app refused, and why — the rules are inspectable, not hidden |
 | About | **How it works** | Every model assumption, the market list, lawful use, Companies House setup |
-| About | **System check** | What works right now: the book's counts, one-click tests of Google News, the direct feeds and Companies House, feed health, versions |
+| About | **System & backup** | **Back up and restore the whole book**, plus what works right now: the book's counts, one-click tests of Google News, the direct feeds and Companies House, feed health, versions |
+
+**Searches run in the background.** Start one and carry on working, change page,
+or close the tab: it keeps going, the sidebar shows its progress, and the result
+is waiting on **Find prospects** when it finishes. One search runs at a time.
+
+**Back up the book if you use the hosted app.** Streamlit Community Cloud resets
+its files on every restart, taking notes, verifications and the contact log with
+them. **System & backup** downloads the whole book as one file and restores it.
 
 Every page, and every panel inside a record, sits behind its own error boundary:
 a fault shows as a contained message in that panel and the rest keeps working.
@@ -421,7 +429,8 @@ ui/
   record.py                 One person's record: header and five tabs
   today.py                  The call list
   workbench_page.py         Add one person; import a CSV
-  system.py                 System check
+  system.py                 System check, backup and restore
+  sweeps.py                 Background searches and their progress
 wealthscan/
   config.py                 Thresholds and every model assumption, in one place
   markets.py                69 markets, presets, and text → market resolution
@@ -442,7 +451,7 @@ wealthscan/
 scripts/
   run_research.py           CLI for a scheduler
   seed_demo.py              52 fictional prospects
-tests_py/test_research.py   142 tests
+tests_py/test_research.py   146 tests
 ```
 
 Run the tests with `python -m unittest discover -s tests_py -v`.

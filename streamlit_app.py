@@ -59,7 +59,7 @@ from wealthscan.queries import (
 )
 from wealthscan.sectors import SECTORS
 from wealthscan.report import generate_and_store
-from wealthscan.research import resolve_lead_with_register, run_research
+from wealthscan.research import resolve_lead_with_register
 from wealthscan.sources import companies_house_available, companies_house_status
 
 from ui.common import (
@@ -79,6 +79,7 @@ from ui.common import (
     refresh,
     where_text,
 )
+from ui import sweeps
 from ui.record import render_record
 from ui.system import page_system
 from ui.today import page_today
@@ -257,12 +258,26 @@ def page_find(frame: pd.DataFrame) -> None:
             "office addresses are collected. See **How it works** for the two-minute setup."
         )
 
-    if st.button("Start searching", type="primary", width="stretch"):
-        _execute_sweep(
-            depth=depth, market_keys=market_keys, events=events,
-            window=window, minutes=minutes, publishers=publishers, verify=verify,
+    running = sweeps.is_running()
+    if st.button("Start searching", type="primary", width="stretch", disabled=running,
+                 help="A search is already running — it has to finish first."
+                 if running else None):
+        sweeps.start_sweep(
+            f"{DEPTH_BY_KEY[depth].label} of {preset_label}",
+            trigger="manual", depth=depth, market_keys=market_keys,
+            event_keys=events or None, days=window or None,
+            include_publishers=publishers, verify_companies_house=verify,
+            time_budget_seconds=(minutes * 60) if minutes else None,
         )
-        return
+        st.rerun()
+
+    job = sweeps.current_job()
+    if job is not None:
+        st.divider()
+        if job.done:
+            sweeps.show_result(job)
+        else:
+            sweeps.live_progress()
 
     if not frame.empty:
         st.divider()
@@ -273,78 +288,6 @@ def page_find(frame: pd.DataFrame) -> None:
         st.caption(
             "Nothing on file yet. To see how the dashboard looks before running a live "
             "search, load the fictional demo data with `python scripts/seed_demo.py`."
-        )
-
-
-def _execute_sweep(
-    *, depth: str, market_keys: list[str], events: list[str],
-    window: int, minutes: int, publishers: bool, verify: bool,
-) -> None:
-    status = st.status("Starting…", expanded=True)
-    bar = st.progress(0.0)
-
-    def report(message: str, fraction: float) -> None:
-        status.update(label=message)
-        bar.progress(min(1.0, fraction))
-
-    result = run_research(
-        trigger="manual",
-        depth=depth,
-        market_keys=market_keys,
-        event_keys=events or None,
-        days=window or None,
-        include_publishers=publishers,
-        verify_companies_house=verify,
-        time_budget_seconds=(minutes * 60) if minutes else None,
-        progress=report,
-    )
-    status.update(
-        label=f"Finished in {result.duration_seconds / 60:.1f} minutes — {result.status}",
-        state="complete",
-    )
-
-    metrics = st.columns(5)
-    metrics[0].metric("Searches run", f"{result.queries_run:,}")
-    metrics[1].metric("Articles read", f"{result.articles_seen:,}")
-    metrics[2].metric("New prospects", result.new_prospects)
-    metrics[3].metric("Corroborated", result.updated_prospects)
-    metrics[4].metric("Company-only leads", result.company_leads)
-
-    if result.new_prospects or result.updated_prospects:
-        with st.spinner("Updating the weekly research document…"):
-            generate_and_store()
-    refresh()
-
-    if result.new_prospects:
-        st.success(
-            f"**{result.new_prospects} new people found.** Open **Prospect list** in the "
-            f"sidebar to work through them."
-        )
-    elif result.company_leads:
-        st.warning(
-            f"No individuals were named, but {result.company_leads} transaction(s) were "
-            f"found with a company and no person. Those are listed in the run log below — "
-            f"the app will not invent a name to fill the gap."
-        )
-    else:
-        st.warning(
-            "Nothing met the criteria. Widen the markets, raise the depth, or lengthen "
-            "the look-back window — and check the warnings below in case the searches "
-            "themselves were blocked."
-        )
-
-    if result.log:
-        with st.expander(f"What was found ({len(result.log)} entries)", expanded=True):
-            for line in result.log:
-                st.text(line)
-    if result.warnings:
-        with st.expander(f"Sources that could not be read ({len(result.warnings)})"):
-            for warning in result.warnings:
-                st.text(warning)
-        st.caption(
-            "Some publishers block automated readers. A blocked feed simply means that "
-            "source contributed nothing this run. If *every* search failed, the network "
-            "this app is running on is blocking outbound requests."
         )
 
 
@@ -1505,6 +1448,11 @@ def _sidebar(frame: pd.DataFrame) -> None:
             + ("connected ✓" if companies_house_available() else "not configured (optional)")
         )
         st.caption("  \n".join(lines))
+        if sweeps.is_running():
+            sweeps.sidebar_progress()
+        if not frame.empty:
+            st.caption("Hosted? Back up your book from **System & backup** — a "
+                       "restart wipes it.")
 
 
 frame = load_prospects()
@@ -1537,7 +1485,7 @@ navigation = st.navigation({
                 icon=":material/block:", url_path="screened-out"),
         st.Page(_page(page_methodology, "How it works"), title="How it works",
                 icon=":material/menu_book:", url_path="how-it-works"),
-        st.Page(_page(page_system, "System check"), title="System check",
+        st.Page(_page(page_system, "System check"), title="System & backup",
                 icon=":material/monitor_heart:", url_path="system"),
     ],
 })

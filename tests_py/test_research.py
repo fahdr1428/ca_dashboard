@@ -1796,5 +1796,79 @@ class TestPricing(unittest.TestCase):
             )
             self.assertTrue(result.ok, result.message)
 
+class TestDailyUse(unittest.TestCase):
+    """Backups, the call sheet, and searches that outlive the page."""
+
+    def test_a_backup_restores_the_whole_book(self):
+        import tempfile
+        from wealthscan import db
+        with tempfile.TemporaryDirectory() as folder:
+            original, fresh = Path(folder) / "a.db", Path(folder) / "b.db"
+            db.init_db(original)
+            with db.connect(original) as conn:
+                pid, _ = db.upsert_prospect(conn, {
+                    "slug": "x", "full_name": "Jane Example", "market_key": "uk-devon",
+                    "market_name": "Devon", "country": "United Kingdom",
+                    "first_seen": db.now_iso(), "last_updated": db.now_iso(),
+                    "first_seen_week": db.iso_week(),
+                })
+                db.log_contact(conn, pid, {"channel": "Letter", "outcome": "Replied"})
+            raw = db.backup_bytes(original)
+            db.init_db(fresh)
+            counts = db.restore_bytes(raw, fresh)
+            self.assertEqual(counts["prospects"], 1)
+            with db.connect(fresh) as conn:
+                self.assertEqual(db.all_prospects(conn)[0]["full_name"], "Jane Example")
+                self.assertEqual(len(db.contacts(conn, pid)), 1)
+
+    def test_a_file_that_is_not_a_backup_is_refused_before_anything_changes(self):
+        from wealthscan import db
+        with self.assertRaises(ValueError):
+            db.backup_summary(b"Person name,Company\nJane,Example Ltd\n")
+
+    def test_the_call_sheet_labels_estimates_and_keeps_only_real_links(self):
+        import pandas as pd
+        from unittest import mock
+        from ui import today
+        row = {"id": 1, "full_name": "Jane Example", "priority": 88, "job_title": "Founder",
+               "company": "Example Ltd", "market_name": "Devon", "country": "United Kingdom",
+               "verification_state": "Confirmed", "why_now": "Sold this week",
+               "next_step": "Ask the adviser", "investable_mid_gbp": 22_200_000,
+               "annual_income_gbp": None}
+        sources = {1: [{"url": "https://www.example.com/a"}, {"url": "import://list/jane"}]}
+        with mock.patch.object(today, "load_sources_index", return_value=sources):
+            sheet = today.call_sheet_csv(pd.DataFrame([row]))
+        self.assertTrue(sheet.startswith("# Call sheet"))
+        self.assertIn("£22.2m", sheet)
+        self.assertIn("not disclosed", sheet)
+        self.assertIn("https://www.example.com/a", sheet)
+        self.assertNotIn("import://", sheet)
+
+    def test_only_one_search_runs_at_a_time(self):
+        import threading
+        from unittest import mock
+        from ui import sweeps
+        release = threading.Event()
+
+        def slow(**_):
+            release.wait(5)
+            from wealthscan.research import RunResult
+            return RunResult(run_id=1, week="x", status="success")
+
+        sweeps._registry()["job"] = None
+        with mock.patch.object(sweeps, "run_research", side_effect=slow):
+            self.assertTrue(sweeps.start_sweep("first"))
+            self.assertTrue(sweeps.is_running())
+            self.assertFalse(sweeps.start_sweep("second"))
+            release.set()
+            for _ in range(100):
+                if not sweeps.is_running():
+                    break
+                threading.Event().wait(0.05)
+        self.assertFalse(sweeps.is_running())
+        self.assertEqual(sweeps.current_job().label, "first")
+        self.assertIsNone(sweeps.current_job().error)
+        sweeps._registry()["job"] = None
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

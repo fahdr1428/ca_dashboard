@@ -893,3 +893,77 @@ def unsuppress_prospect(conn: sqlite3.Connection, prospect_id: int) -> None:
         "UPDATE prospects SET suppressed_at = NULL, suppression_reason = NULL WHERE id = ?",
         (prospect_id,),
     )
+
+
+# ---------------------------------------------------------------------------
+# Backup and restore
+# ---------------------------------------------------------------------------
+#
+# Hosted Streamlit resets its filesystem when the app restarts, and with it the
+# advisor's notes, verifications and contact log. A backup is the whole book as
+# one file; restoring it puts everything back exactly.
+
+def backup_bytes(path: Path | None = None) -> bytes:
+    """A consistent copy of the whole book, safe to take while a search runs."""
+    import tempfile
+
+    source = sqlite3.connect(Path(path or DB_PATH))
+    with tempfile.TemporaryDirectory() as folder:
+        copy_path = Path(folder) / "book.db"
+        copy = sqlite3.connect(copy_path)
+        try:
+            source.backup(copy)
+        finally:
+            copy.close()
+            source.close()
+        return copy_path.read_bytes()
+
+
+def backup_summary(raw: bytes) -> dict[str, int]:
+    """Check a backup is really this app's book before anything is replaced.
+
+    Raises ValueError with a plain reason if it is not.
+    """
+    import tempfile
+
+    if not raw.startswith(b"SQLite format 3\x00"):
+        raise ValueError("That file is not a backup from this app (not a SQLite database).")
+    with tempfile.TemporaryDirectory() as folder:
+        candidate = Path(folder) / "restore.db"
+        candidate.write_bytes(raw)
+        conn = sqlite3.connect(candidate)
+        try:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if "prospects" not in tables or "sources" not in tables:
+                raise ValueError("That database has no prospect book in it.")
+            counts = {"prospects": conn.execute("SELECT COUNT(*) FROM prospects").fetchone()[0],
+                      "sources": conn.execute("SELECT COUNT(*) FROM sources").fetchone()[0]}
+            if "contacts" in tables:
+                counts["contacts"] = conn.execute("SELECT COUNT(*) FROM contacts").fetchone()[0]
+            return counts
+        finally:
+            conn.close()
+
+
+def restore_bytes(raw: bytes, path: Path | None = None) -> dict[str, int]:
+    """Replace the book with a backup, then bring its schema up to date."""
+    import tempfile
+
+    counts = backup_summary(raw)
+    target = Path(path or DB_PATH)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory() as folder:
+        candidate = Path(folder) / "restore.db"
+        candidate.write_bytes(raw)
+        source = sqlite3.connect(candidate)
+        destination = sqlite3.connect(target)
+        try:
+            # The backup API copies page by page into the live file, so any
+            # connection opened afterwards sees the restored book.
+            source.backup(destination)
+        finally:
+            destination.close()
+            source.close()
+    init_db(target)  # an older backup is migrated forward, never rejected
+    return counts
